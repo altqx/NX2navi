@@ -80,6 +80,11 @@ def _unquote(s, where):
     return ''.join(out)
 
 
+def _comment(rest):
+    """A comment line's text: dumps writes one space after the marker; spaces the text itself starts with stay."""
+    return (rest[1:] if rest.startswith(' ') else rest).rstrip()
+
+
 def loads(text, name='<po>'):
     """(header [(name, value)], [Entry])."""
     entries, header = [], []
@@ -114,7 +119,7 @@ def loads(text, name='<po>'):
                 cur = None
             cur = cur or start()
             if line.startswith('#.'):
-                cur['comments'].append(line[2:].strip())
+                cur['comments'].append(_comment(line[2:]))
             elif line.startswith('#:'):
                 cur['refs'] += line[2:].split()
             elif line.startswith('#,'):
@@ -127,7 +132,7 @@ def loads(text, name='<po>'):
                 elif rest.startswith('"') and prev_key == 'previous':
                     cur['previous'] += _unquote(rest, where)
             else:
-                cur['notes'].append(line[1:].strip())
+                cur['notes'].append(_comment(line[1:]))
             continue
         for kw in ('msgctxt', 'msgid', 'msgstr'):
             if line.startswith(kw + ' ') or line.startswith(kw + '"'):

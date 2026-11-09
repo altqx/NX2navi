@@ -59,6 +59,8 @@ shape = true
 # own proportion to its Latin, matched to the game font's x height), shift raises them in ems (negative lowers).
 # The Japanese fonts are CID-keyed and cannot take new letters; Cetra Display Pro serves every character the
 # Japanese styles draw before them, so its two weights cover dialogue, menus, headings and credits.
+# mode = "replace" puts the font file in the game font's place instead (any game font, CID-keyed ones too): all of its
+# characters at the game font's x height, the game font's own glyphs kept for what it lacks (keep = false drops them).
 [fonts]
 # "CetraDisplayPro-Regular" = {{ file = "fonts/YourThaiFont-Regular.ttf", size = 1.0, shift = 0.0 }}
 # "CetraDisplayPro-Medium" = {{ file = "fonts/YourThaiFont-Medium.ttf", size = 1.0, shift = 0.0 }}
@@ -229,34 +231,8 @@ class Project:
         for path in self.po_files():
             rel = path.relative_to(self.root)
             for e in self.load(path):
-                if not e.msgstr:
-                    continue
-                where = f'{rel} [{e.ctx}]'
-                try:
-                    msbt.from_markup(e.msgstr)
-                except msbt.MarkupError as err:
-                    out.append(('error', where, str(err)))
-                    continue
-                want, got = collections.Counter(msbt.codes(e.msgid)), collections.Counter(msbt.codes(e.msgstr))
-                if want != got:
-                    missing = ' '.join((want - got).elements())
-                    extra = ' '.join((got - want).elements())
-                    out.append(('error', where, f'control codes differ from the source: '
-                                f'{"missing " + missing if missing else ""}{"; " if missing and extra else ""}'
-                                f'{"extra " + extra if extra else ""}'))
-                if collections.Counter(msbt.icons(e.msgid)) != collections.Counter(msbt.icons(e.msgstr)):
-                    out.append(('warning', where, 'button icons ({U+....}) differ from the source'))
-                if e.msgstr != e.msgid and CJK.search(fonts._clean(e.msgstr)):
-                    out.append(('warning', where, 'Japanese characters left in the translation'))
-                ref = reference_text(e)
-                if ref:
-                    limit = max(len(line) for line in fonts._clean(ref).split('\n'))
-                    for line in fonts._clean(e.msgstr).split('\n'):
-                        width = sum(1 for c in line if c not in THAI_MARKS)
-                        if width > max(limit * 1.15, limit + 4):
-                            out.append(('warning', where, f'a line of {width} characters; the reference\'s longest '
-                                        f'is {limit}: it may not fit the box'))
-                            break
+                if e.msgstr:
+                    out += [(level, f'{rel} [{e.ctx}]', text) for level, text in check_entry(e)]
         return out
 
     # ---- build
@@ -332,10 +308,18 @@ class Project:
                 raise ProjectError(f'[fonts] {game_font}: {src} is missing')
             blob = self.game.read(paths[game_font])
             font, key = fonts.decode(blob)
-            merged, unit, added = fonts.merge_thai(font, src.read_bytes(), spec.get('size', 1.0), spec.get('shift', 0.0),
-                                                   codes)
+            mode = spec.get('mode', 'merge')
+            if mode == 'replace':
+                merged, unit, added = fonts.replace_font(font, src.read_bytes(), spec.get('size', 1.0),
+                                                         spec.get('shift', 0.0), codes, spec.get('keep', True))
+            elif mode == 'merge':
+                merged, unit, added = fonts.merge_thai(font, src.read_bytes(), spec.get('size', 1.0),
+                                                       spec.get('shift', 0.0), codes)
+            else:
+                raise ProjectError(f'[fonts] {game_font}: mode is "merge" or "replace", not {mode!r}')
             put(paths[game_font], self.game.store_like(paths[game_font], fonts.encode(merged, key, blob)))
-            log(f'  font: {game_font} + {len(added)} characters of {src.name} (x{unit:.3f})')
+            verb = 'replaced by' if mode == 'replace' else '+'
+            log(f'  font: {game_font} {verb} {len(added)} characters of {src.name} (x{unit:.3f})')
 
         # textures
         edits = self.texture_edits()
@@ -468,3 +452,33 @@ def _alpha(game, path):
     data = game.read(path)
     (tex,) = textures.textures(data)
     return textures.decode(tex, data)[..., 3]
+
+
+def check_entry(e):
+    """[(level, text)] of one translated entry (Project.check)."""
+    out = []
+    try:
+        msbt.from_markup(e.msgstr)
+    except msbt.MarkupError as err:
+        return [('error', str(err))]
+    want, got = collections.Counter(msbt.codes(e.msgid)), collections.Counter(msbt.codes(e.msgstr))
+    if want != got:
+        missing = ' '.join((want - got).elements())
+        extra = ' '.join((got - want).elements())
+        out.append(('error', f'control codes differ from the source: '
+                    f'{"missing " + missing if missing else ""}{"; " if missing and extra else ""}'
+                    f'{"extra " + extra if extra else ""}'))
+    if collections.Counter(msbt.icons(e.msgid)) != collections.Counter(msbt.icons(e.msgstr)):
+        out.append(('warning', 'button icons ({U+....}) differ from the source'))
+    if e.msgstr != e.msgid and CJK.search(fonts._clean(e.msgstr)):
+        out.append(('warning', 'Japanese characters left in the translation'))
+    ref = reference_text(e)
+    if ref:
+        limit = max(len(line) for line in fonts._clean(ref).split('\n'))
+        for line in fonts._clean(e.msgstr).split('\n'):
+            width = sum(1 for c in line if c not in THAI_MARKS)
+            if width > max(limit * 1.15, limit + 4):
+                out.append(('warning', f'a line of {width} characters; the reference\'s longest is {limit}: '
+                            'it may not fit the box'))
+                break
+    return out

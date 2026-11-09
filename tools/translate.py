@@ -4,9 +4,11 @@
     python tools/translate.py extract   [--project P]   PO files from the game, translations kept
     python tools/translate.py status    [--project P]   progress
     python tools/translate.py check     [--project P]   errors and hints in the translation
-    python tools/translate.py fonts     [--project P] [--compare FONT [--game-font NAME] [--size S] [--shift EM]]
+    python tools/translate.py fonts     [--project P] [--compare FONT [--game-font NAME] [--size S] [--shift EM] [--replace]]
     python tools/translate.py textures  [--project P] [--match REGEX]   PNGs of the lettered (or matching) textures
     python tools/translate.py build     [--project P]   the mod, into <install folder>/mods/<mod>
+    python tools/translate.py serve     [--project P] [--port N]   the translator's desk, a local web page: each
+                                                               message with its reference and voices, saved to PO
     python tools/translate.py selftest  [--game <install folder>]   every text archive, font and lettered texture
                                                                read and written back unchanged
 
@@ -89,7 +91,7 @@ def cmd_check(a):
 def cmd_fonts(a):
     p = pj.Project(a.project)
     if a.compare:
-        path, unit = reference.compare(p, Path(a.compare).expanduser(), a.game_font, a.size, a.shift)
+        path, unit = reference.compare(p, Path(a.compare).expanduser(), a.game_font, a.size, a.shift, a.replace)
         print(f'{path} (Thai letters at x{unit:.3f} of their own size)')
         return 0
     reference.write(p)
@@ -98,6 +100,11 @@ def cmd_fonts(a):
 
 def cmd_textures(a):
     run_textures(pj.Project(a.project), a.match)
+
+
+def cmd_serve(a):
+    from translation import server
+    server.serve(pj.Project(a.project), a.port)
 
 
 def cmd_build(a):
@@ -163,7 +170,7 @@ def main():
     s.add_argument('--reference', default='USen', help='the language shown beside each message (default USen)')
     s.add_argument('--mod', default='Thai', help='the mod folder\'s name (default Thai)')
     s.add_argument('--language', default='th', help='the PO files\' language (default th)')
-    for name in ('extract', 'status', 'check', 'fonts', 'textures', 'build'):
+    for name in ('extract', 'status', 'check', 'fonts', 'textures', 'build', 'serve'):
         s = sub.add_parser(name)
         s.add_argument('--project', default='.', help='the project folder (default: the current folder)')
         if name == 'fonts':
@@ -171,6 +178,9 @@ def main():
             s.add_argument('--game-font', default='CetraDisplayPro-Regular')
             s.add_argument('--size', type=float, default=1.0)
             s.add_argument('--shift', type=float, default=0.0)
+            s.add_argument('--replace', action='store_true', help="put the font in the game font's place instead of merging its Thai letters")
+        if name == 'serve':
+            s.add_argument('--port', type=int, default=8765, help='the local port (default 8765)')
         if name == 'textures':
             s.add_argument('--match', help='a regular expression over RomFS paths: export those textures instead')
     s = sub.add_parser('selftest')

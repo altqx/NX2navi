@@ -266,6 +266,122 @@ def merge_thai(game_font, thai_font, size=1.0, shift=0.0, clusters=None):
     return out.getvalue(), unit, added
 
 
+def _shape(font_bytes, text, names):
+    """[(glyph name, x, y)] and the advance of text shaped with the font, in its units."""
+    import uharfbuzz as hb
+    buf = hb.Buffer()
+    buf.add_str(text)
+    buf.guess_segment_properties()
+    hb.shape(hb.Font(hb.Face(hb.Blob(font_bytes))), buf, {})
+    parts, x = [], 0
+    for info, pos in zip(buf.glyph_infos, buf.glyph_positions):
+        parts.append((names[info.codepoint], x + pos.x_offset, pos.y_offset))
+        x += pos.x_advance
+    return parts, x
+
+
+def replace_font(game_font, new_font, size=1.0, shift=0.0, clusters=None, keep=True):
+    """A font that takes the game font's place: every character of new_font (any outline format) at auto_scale times
+    size, raised by shift ems, one glyph for each cluster of clusters ({cluster: private-use character}, shaped with
+    new_font), a zero-width space, and (keep) the game font's own glyphs for the characters new_font lacks (kana,
+    kanji, Hangul), so untranslated text still draws. CID-keyed fonts can be replaced. The result has the game font's
+    outline format, units per em, vertical metrics and names, so the styles that name it and their scales still apply.
+    Returns (font bytes, the factor from new font units to game font units, the characters from new_font)."""
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.boundsPen import BoundsPen
+    from fontTools.pens.recordingPen import DecomposingRecordingPen
+    from fontTools.pens.transformPen import TransformPen
+    unit = auto_scale(game_font, new_font) * size
+    g, n = tt(game_font), tt(new_font)
+    cff = 'CFF ' in g
+    upm = g['head'].unitsPerEm
+    lift = shift * upm
+    gcmap, ncmap = g.getBestCmap() or {}, n.getBestCmap() or {}
+    ggs, ngs = g.getGlyphSet(), n.getGlyphSet()
+    order, outlines, metrics, cmap = [], {}, {}, {}
+    made = {}
+
+    def glyph(name, advance, parts):
+        """parts [(glyph set, glyph name, scale, x, y)], advance in game units."""
+        rec = DecomposingRecordingPen(None)
+        for gs, src, k, x, y in parts:
+            dec = DecomposingRecordingPen(gs)
+            gs[src].draw(dec)
+            dec.replay(TransformPen(rec, (k, 0, 0, k, x, y)))
+        bounds = BoundsPen(None)
+        rec.replay(bounds)
+        advance = max(0, round(advance))
+        if cff:
+            from fontTools.pens.t2CharStringPen import T2CharStringPen
+            pen = T2CharStringPen(advance, None)
+            rec.replay(pen)
+            outlines[name] = pen.getCharString()
+        else:
+            from fontTools.pens.cu2quPen import Cu2QuPen
+            from fontTools.pens.ttGlyphPen import TTGlyphPen
+            pen = TTGlyphPen(None)
+            rec.replay(Cu2QuPen(pen, 1.0, reverse_direction=False))
+            outlines[name] = pen.glyph()
+        metrics[name] = (advance, round(bounds.bounds[0]) if bounds.bounds else 0)
+        order.append(name)
+
+    def from_new(src):
+        if src not in made:
+            made[src] = f'n{len(order)}'
+            glyph(made[src], n['hmtx'].metrics[src][0] * unit, [(ngs, src, unit, 0, lift)])
+        return made[src]
+
+    def from_game(src):
+        key = ('game', src)
+        if key not in made:
+            made[key] = f'g{len(order)}'
+            glyph(made[key], g['hmtx'].metrics[src][0], [(ggs, src, 1, 0, 0)])
+        return made[key]
+
+    glyph('.notdef', n['hmtx'].metrics['.notdef'][0] * unit, [(ngs, '.notdef', unit, 0, lift)])
+    for cp, src in sorted(ncmap.items()):
+        cmap[cp] = from_new(src)
+    if keep:
+        for cp, src in sorted(gcmap.items()):
+            if cp not in cmap:
+                cmap[cp] = from_game(src)
+    if ZWSP not in cmap:
+        glyph('zwsp', 0, [])
+        cmap[ZWSP] = 'zwsp'
+    names = n.getGlyphOrder()
+    for cluster, ch in (clusters or {}).items():
+        parts, advance = _shape(new_font, cluster, names)
+        name = f'u{ord(ch):04X}'
+        glyph(name, advance * unit, [(ngs, src, unit, x * unit, y * unit + lift) for src, x, y in parts])
+        cmap[ord(ch)] = name
+
+    fb = FontBuilder(upm, isTTF=not cff)
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap(cmap)
+    ps = g['name'].getDebugName(6) or 'Font'
+    if cff:
+        fb.setupCFF(ps, {'FullName': g['name'].getDebugName(4) or ps}, outlines, {})
+    else:
+        fb.setupGlyf(outlines)
+    fb.setupHorizontalMetrics(metrics)
+    hh = g['hhea']
+    fb.setupHorizontalHeader(ascent=hh.ascent, descent=hh.descent, lineGap=hh.lineGap)
+    os2 = {}
+    if 'OS/2' in g:
+        o = g['OS/2']
+        os2 = {k: getattr(o, k) for k in ('usWeightClass', 'usWidthClass', 'sTypoAscender', 'sTypoDescender',
+                                          'sTypoLineGap', 'usWinAscent', 'usWinDescent', 'sxHeight', 'sCapHeight')
+               if hasattr(o, k)}
+    fb.setupOS2(fsType=0, **os2)
+    fb.setupPost()
+    fb.font['name'] = g['name']
+    if 'head' in g:
+        fb.font['head'].macStyle = g['head'].macStyle
+    out = io.BytesIO()
+    fb.font.save(out)
+    return out.getvalue(), unit, sorted(ncmap)
+
+
 # ---- specimens
 
 THAI_SAMPLES = [

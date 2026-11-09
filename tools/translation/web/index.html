@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Translator's desk</title>
+<link rel="stylesheet" href="desk.css">
+</head>
+<body>
+<div class="desk">
+  <aside class="files" aria-label="Message files">
+    <header class="files-head">
+      <h1 id="title">Translator's desk</h1>
+      <p id="subtitle" class="muted"></p>
+      <div class="progress" id="total-progress" aria-hidden="true"><i></i><b></b></div>
+      <p id="total-count" class="count"></p>
+    </header>
+    <label class="search">
+      <span class="visually-hidden">Search all messages</span>
+      <input id="search" type="search" placeholder="Search source, English, Thai or label" autocomplete="off">
+    </label>
+    <div class="filters" role="radiogroup" aria-label="Show files">
+      <button type="button" data-filter="all" class="on" role="radio" aria-checked="true">All</button>
+      <button type="button" data-filter="todo" role="radio" aria-checked="false">To translate</button>
+      <button type="button" data-filter="voiced" role="radio" aria-checked="false">Voiced</button>
+    </div>
+    <nav id="file-list" class="file-list"></nav>
+  </aside>
+
+  <section class="messages" aria-label="Messages of the file">
+    <header class="messages-head">
+      <h2 id="file-name">Pick a file</h2>
+      <p id="file-count" class="count"></p>
+      <div class="filters small" role="radiogroup" aria-label="Show messages">
+        <button type="button" data-show="all" class="on" role="radio" aria-checked="true">All</button>
+        <button type="button" data-show="todo" role="radio" aria-checked="false">To translate</button>
+        <button type="button" data-show="fuzzy" role="radio" aria-checked="false">Needs review</button>
+      </div>
+    </header>
+    <ol id="message-list" class="message-list"></ol>
+  </section>
+
+  <main class="editor" id="editor" aria-live="polite">
+    <div class="empty">
+      <p>Choose a file on the left, then a message.</p>
+      <p class="muted">Files with a speaker icon have voiced lines.</p>
+    </div>
+  </main>
+</div>
+
+<template id="editor-template">
+  <header class="editor-head">
+    <p class="crumb"><span data-f="path"></span> <span class="sep">/</span> <strong data-f="ctx"></strong></p>
+    <p class="nav">
+      <button type="button" data-act="prev" title="Previous message (Alt+↑)">↑ Previous</button>
+      <button type="button" data-act="next" title="Next message (Alt+↓)">Next ↓</button>
+    </p>
+  </header>
+
+  <section class="pane source" lang="ja">
+    <div class="pane-head">
+      <h3>Japanese</h3>
+      <button type="button" class="voice" data-voice="slot" title="Play the Japanese voice (Alt+J)" hidden>
+        <span class="glyph" aria-hidden="true"></span><span class="voice-label">Japanese voice</span>
+        <span class="voice-bar"><i></i></span>
+      </button>
+      <label class="toggle"><input type="checkbox" data-f="readings" checked> Readings</label>
+    </div>
+    <div class="text ja" data-f="msgid"></div>
+    <details class="previous" hidden>
+      <summary>The source changed since this was translated</summary>
+      <div class="text ja" data-f="previous"></div>
+    </details>
+  </section>
+
+  <section class="pane reference" lang="en">
+    <div class="pane-head">
+      <h3 data-f="ref-name">English</h3>
+      <button type="button" class="voice" data-voice="reference" title="Play the English voice (Alt+E)" hidden>
+        <span class="glyph" aria-hidden="true"></span><span class="voice-label">English voice</span>
+        <span class="voice-bar"><i></i></span>
+      </button>
+    </div>
+    <div class="text en" data-f="ref"></div>
+  </section>
+
+  <section class="pane target" lang="th">
+    <div class="pane-head">
+      <h3>Thai</h3>
+      <div class="chips" data-f="chips" aria-label="Control codes of the source: click to insert"></div>
+    </div>
+    <textarea data-f="msgstr" rows="3" spellcheck="false"
+      aria-label="Thai translation" placeholder="Write the Thai here. Break lines where the box should break them."></textarea>
+    <div class="box-wrap">
+      <div class="box" data-f="preview" aria-label="Preview in a dialogue box"></div>
+      <ul class="widths" data-f="widths" aria-label="Characters per line"></ul>
+    </div>
+    <ul class="checks" data-f="checks"></ul>
+  </section>
+
+  <section class="pane glossary" data-f="glossary-pane" hidden>
+    <h3>Names in this message</h3>
+    <ul data-f="glossary"></ul>
+  </section>
+
+  <footer class="actions">
+    <label class="toggle"><input type="checkbox" data-f="fuzzy"> Needs review</label>
+    <details class="note">
+      <summary>Note</summary>
+      <textarea data-f="note" rows="2" placeholder="A note for yourself, kept in the PO file"></textarea>
+    </details>
+    <span class="state" data-f="state"></span>
+    <button type="button" class="primary" data-act="save" title="Save and go to the next message to translate (Ctrl+Enter)">
+      Save and next
+    </button>
+  </footer>
+</template>
+
+<template id="keys-template">
+  <p class="keys"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> save and next · <kbd>Ctrl</kbd>+<kbd>S</kbd> save ·
+    <kbd>Alt</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> move · <kbd>Alt</kbd>+<kbd>J</kbd> Japanese voice ·
+    <kbd>Alt</kbd>+<kbd>E</kbd> English voice · <kbd>Alt</kbd>+<kbd>R</kbd> needs review</p>
+</template>
+
+<script src="desk.js"></script>
+</body>
+</html>

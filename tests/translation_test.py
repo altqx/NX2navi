@@ -147,6 +147,139 @@ class Thai(unittest.TestCase):
         self.assertTrue(all(0xe800 <= ord(c) < 0xf700 for c in codes.values()))
         self.assertEqual(out.count(' '), 3)
 
+    def test_replace_font(self):
+        # a CFF "game font" with x and a kana, a TrueType "new font" with x and Thai ko and a tone mark
+        game = box_font({'x': (500, 500), 'kana': (1000, 800)}, {ord('x'): 'x', ord('あ'): 'kana'}, 1000, cff=True)
+        new = box_font({'x': (300, 250), 'ko': (300, 250), 'tone': (0, 100)},
+                       {ord('x'): 'x', 0x0e01: 'ko', 0x0e48: 'tone'}, 500, cff=False)
+        codes = fonts.cluster_codes(['ก่'])
+        out, unit, added = fonts.replace_font(game, new, clusters=codes)
+        self.assertAlmostEqual(unit, 2.0)                   # 500 / 250: the x heights match
+        t = fonts.tt(out)
+        self.assertIn('CFF ', t)
+        self.assertEqual(t['head'].unitsPerEm, 1000)
+        cmap = t.getBestCmap()
+        for cp in (ord('x'), ord('あ'), 0x0e01, 0x0e48, fonts.ZWSP, ord(codes['ก่'])):
+            self.assertIn(cp, cmap)
+        self.assertEqual(t['hmtx'][cmap[ord('x')]][0], 600)     # the new font's x, scaled
+        self.assertEqual(t['hmtx'][cmap[ord('あ')]][0], 1000)   # the game's kana kept
+        self.assertEqual(sorted(added), [ord('x'), 0x0e01, 0x0e48])
+        dropped = fonts.tt(fonts.replace_font(game, new, keep=False)[0]).getBestCmap()
+        self.assertNotIn(ord('あ'), dropped)
+
+
+class PoComments(unittest.TestCase):
+    def test_leading_space_of_a_comment_line_stays(self):
+        text = ('msgid ""\nmsgstr ""\n"Language: th\\n"\n\n#. ref: first line\n#.  second starts with a space\n'
+                'msgctxt "a"\nmsgid "x"\nmsgstr ""\n')
+        header, entries = po.loads(text)
+        self.assertEqual(entries[0].comments, ['ref: first line\n second starts with a space'])
+        self.assertEqual(po.dumps(header, entries), text)
+
+
+class Voice(unittest.TestCase):
+    PACKETS = [bytes([0xf8]) + bytes(range(1, 40)), bytes([0xf8]) + bytes(300), bytes([0xf8, 0x55])]
+
+    def switch_opus(self):
+        data = b''.join(struct.pack('>II', len(p), 0x12345678) + p for p in self.PACKETS)
+        head = struct.pack('<II', 0x80000001, 0x18) + struct.pack('<BBHIIII', 0, 1, 0, 48000, 0x20, 0, 312)
+        return head + bytes(0x20 - len(head)) + struct.pack('<II', 0x80000004, len(data)) + data
+
+    def test_ogg_of_switch_opus(self):
+        from translation import voice
+        out = voice.ogg(self.switch_opus())
+        pages, at = [], 0
+        while at < len(out):
+            self.assertEqual(out[at:at + 4], b'OggS')
+            flags, granule, crc, nseg = out[at + 5], struct.unpack_from('<q', out, at + 6)[0], \
+                struct.unpack_from('<I', out, at + 22)[0], out[at + 26]
+            lacing = out[at + 27:at + 27 + nseg]
+            size = 27 + nseg + sum(lacing)
+            page = bytearray(out[at:at + size])
+            page[22:26] = bytes(4)
+            self.assertEqual(voice.ogg_crc(bytes(page)), crc)
+            body, packets, cur, pos = out[at + 27 + nseg:at + size], [], b'', 0
+            for n in lacing:
+                cur += body[pos:pos + n]
+                pos += n
+                if n < 255:
+                    packets.append(cur)
+                    cur = b''
+            pages.append((flags, granule, packets))
+            at += size
+        self.assertEqual(pages[0][2][0][:8], b'OpusHead')
+        self.assertEqual(struct.unpack_from('<H', pages[0][2][0], 10)[0], 312)    # pre-skip
+        self.assertEqual(pages[1][2][0][:8], b'OpusTags')
+        self.assertEqual([p for page in pages[2:] for p in page[2]], self.PACKETS)
+        self.assertEqual(pages[-1][1], 3 * 960)        # three 20 ms packets
+        self.assertTrue(pages[0][0] & 2 and pages[-1][0] & 4)
+
+    def test_index(self):
+        from translation import voice
+
+        class Game:
+            files = {'Voice/Resource/Stream/JPja_EventFlowMsg-_Dm_A_0000--Dm_A_0000_Text_000_b.bwav': 0,
+                     'Voice/Resource/Stream/USen_EventFlowMsg-_Dm_A_0000--Dm_A_0000_Text_000_b.bwav': 0,
+                     'Voice/Resource/Stream/EventFlowMsg-_Dm_B--Dm_B_Text_001.bwav': 0,
+                     'Voice/Resource/JPja_EventFlowMsg-_Dm_A_0000.bars.zs': 0}
+        idx = voice.index(Game)
+        self.assertEqual(sorted(idx[('EventFlowMsg/Dm_A_0000', 'Dm_A_0000_Text_000_b')]), ['JPja', 'USen'])
+        self.assertEqual(list(idx[('EventFlowMsg/Dm_B', 'Dm_B_Text_001')]), [''])
+
+
+class Desk(unittest.TestCase):
+    def test_save_changes_one_entry(self):
+        import tempfile
+        from types import SimpleNamespace
+        from translation import server
+        with tempfile.TemporaryDirectory() as tmp:
+            text = Path(tmp) / 'text' / 'G'
+            text.mkdir(parents=True)
+            entries = [po.Entry(ctx='a', msgid='{0.3:0000}名{0.3:ffff}', comments=['ref: {0.3:0000}Name{0.3:ffff}']),
+                       po.Entry(ctx='b', msgid='別', msgstr='อื่น')]
+            (text / 'F.po').write_text(po.dumps([('Language', 'th')], entries), encoding='utf-8')
+            desk = server.Desk.__new__(server.Desk)
+            desk.p, desk.voices, desk._parsed = SimpleNamespace(text=Path(tmp) / 'text'), {}, {}
+            desk.lock = __import__('threading').Lock()
+            r = desk.save('G/F', 'a', 'ชื่อ', True, 'check the name')
+            self.assertEqual([c['level'] for c in r['entry']['checks']], ['error'])     # the colour codes are gone
+            self.assertEqual((r['done'], r['fuzzy'], r['total']), (1, 1, 2))
+            _, back = po.loads((text / 'F.po').read_text(encoding='utf-8'))
+            self.assertEqual((back[0].msgstr, back[0].fuzzy, back[0].notes), ('ชื่อ', True, ['check the name']))
+            self.assertEqual(back[1].msgstr, 'อื่น')
+            with self.assertRaises(KeyError):
+                desk.save('../outside', 'a', 'x', False, None)
+
+
+def box_font(glyphs, cmap, upm, cff):
+    """A font of boxes: glyphs {name: (advance, height)}."""
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    import io
+    glyphs = {'.notdef': (upm // 2, upm // 2), **glyphs}
+    fb = FontBuilder(upm, isTTF=not cff)
+    fb.setupGlyphOrder(list(glyphs))
+    fb.setupCharacterMap(cmap)
+    outlines = {}
+    for name, (adv, h) in glyphs.items():
+        pen = T2CharStringPen(adv, None) if cff else TTGlyphPen(None)
+        pen.moveTo((10, 0)); pen.lineTo((10, h)); pen.lineTo((max(adv, 40) - 10, h)); pen.lineTo((max(adv, 40) - 10, 0))
+        pen.closePath()
+        outlines[name] = pen.getCharString() if cff else pen.glyph()
+    if cff:
+        fb.setupCFF('Box', {}, outlines, {})
+    else:
+        fb.setupGlyf(outlines)
+    fb.setupHorizontalMetrics({n: (a, 10) for n, (a, _) in glyphs.items()})
+    fb.setupHorizontalHeader(ascent=upm * 4 // 5, descent=-upm // 5)
+    fb.setupNameTable({'familyName': 'Box', 'styleName': 'Regular'})
+    fb.setupOS2()
+    fb.setupPost()
+    out = io.BytesIO()
+    fb.font.save(out)
+    return out.getvalue()
+
 
 if __name__ == '__main__':
     unittest.main()

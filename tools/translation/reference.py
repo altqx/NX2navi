@@ -142,8 +142,9 @@ def samples_md(project, texts):
     return '\n'.join(out) + '\n'
 
 
-def compare(project, thai_path, game_font='CetraDisplayPro-Regular', size=1.0, shift=0.0):
-    """reference/specimens/compare-<font>.png: the candidate merged into game_font as the build would do it, drawn
+def compare(project, thai_path, game_font='CetraDisplayPro-Regular', size=1.0, shift=0.0, replace=False):
+    """reference/specimens/compare-<font>.png: the candidate merged into game_font (or replacing it: replace) as the
+    build would do it, drawn
     without shaping (each character at its own place, as a plain text engine draws) and with it, beside the game's
     own text in the same font. Returns the image's path and the scale used."""
     paths = fonts.scalable(project.game)
@@ -152,9 +153,10 @@ def compare(project, thai_path, game_font='CetraDisplayPro-Regular', size=1.0, s
     font, _ = fonts.decode(project.game.read(paths[game_font]))
     thai = thai_path.read_bytes()
     codes = fonts.cluster_codes(fonts.clusters_in(fonts.THAI_SAMPLES + [MIXED]))
-    merged, unit, added = fonts.merge_thai(font, thai, size, shift, codes)
+    make = fonts.replace_font if replace else fonts.merge_thai
+    merged, unit, added = make(font, thai, size, shift, codes)
     lines = [t for _, t in samples(project, project.reference or project.slot)['Dialogue'][:2]]
-    rows = [(None, 30, f'{thai_path.name} merged into {game_font} (x{unit:.3f}, {len(added)} characters)', 'basic'),
+    rows = [(None, 30, f'{thai_path.name} {"replacing" if replace else "merged into"} {game_font} (x{unit:.3f}, {len(added)} characters)', 'basic'),
             (None, 22, 'the game\'s own text in this font', 'basic')]
     rows += [(font, 46, t, 'basic') for t in lines]
     rows += [(None, 22, 'as the game draws it: each Thai cluster precomposed by the build (fonts.CLUSTER)', 'basic')]
@@ -162,6 +164,9 @@ def compare(project, thai_path, game_font='CetraDisplayPro-Regular', size=1.0, s
     rows += [(None, 22, 'without precomposing: each mark at its default place, as a text engine without Thai shaping '
               'draws it (shape = false)', 'basic')]
     rows += [(merged, 46, t, 'basic') for t in fonts.THAI_SAMPLES]
+    if replace:
+        rows += [(None, 22, 'the game\'s own text in the replacement', 'basic')]
+        rows += [(merged, 46, t, 'basic') for t in lines]
     out = project.root / 'reference' / 'specimens' / f'compare-{thai_path.stem}-{game_font}.png'
     out.parent.mkdir(parents=True, exist_ok=True)
     fonts.render(out, rows)
