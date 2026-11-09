@@ -1478,7 +1478,7 @@ def step_key(step, identity, out=None):
     if step == 'compile':
         return compile_key
     # shaders: the built game and the translator that prepared them
-    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(KIT / "bin" / "nx2navi_xlate.id")}'
+    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(xlate_source() / "nx2navi_xlate.id")}'
 
 
 def main():

@@ -222,6 +222,7 @@ def main() -> None:
     if not dotnet:
         sys.exit("missing: dotnet (.NET 10 SDK)")
     env = dict(os.environ)
+    env["DOTNET_DISABLE_WORKLOAD_SETS"] = "1"
     if WIN:
         if not (VSWHERE_DIR / "vswhere.exe").is_file() and not shutil.which("vswhere"):
             sys.exit(f"missing: vswhere.exe (expected in {VSWHERE_DIR}); NativeAOT cannot link without it")
