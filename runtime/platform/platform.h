@@ -271,6 +271,9 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c));
 // What this thread is doing, named by the crash notes (a stack overflow leaves no room for the full report); NULL
 // clears it. s must stay valid until it is cleared.
 void plat_crash_context(const char *s);
+// Puts the crash hook's last-chance exception filter back in place. 1 when a DLL loaded later had set its own in its
+// place (who: that filter's module and offset), 0 when it was still there. Windows only; 0 elsewhere.
+int plat_crash_filter_reassert(char *who, size_t n);
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure

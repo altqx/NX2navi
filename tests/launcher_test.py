@@ -1432,9 +1432,9 @@ class MakeGameTest(Tmp):
         sys.path.insert(0, str(self.layout.pydeps))   # the fake zbic
         self.addCleanup(sys.path.remove, str(self.layout.pydeps))
         with mock.patch.multiple(self.mg, KIT=kit, PROMPT_PACKAGES={}, EVENTS=False, step_romfs=fake('romfs'),
-                                 step_lift=fake('lift'), step_compile=fake('compile'), step_shaders=fake('shaders')):
+                                 step_lift=fake('lift'), step_compile=fake('compile'), step_scan=fake('scan'), step_shaders=fake('shaders')):
             others, ev, runs = build()
-            self.assertEqual((others, runs), (['compile', 'lift', 'romfs', 'shaders'], 1))
+            self.assertEqual((others, runs), (['compile', 'lift', 'romfs', 'scan', 'shaders'], 1))
             self.assertEqual(states(ev), ['start', 'done'])
             fractions = [e['fraction'] for e in ev if e['ev'] == 'progress']
             self.assertEqual(fractions, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
@@ -1657,13 +1657,13 @@ class MakeGameTest(Tmp):
     def test_dlssg_beside_the_game(self):
         """DLSS Frame Generation's files go beside the game only as a whole set, with the licence texts; the release
         script (tools/make_launcher.py) and the build agree on the set."""
-        import make_launcher
+        import streamline_pin
         from unittest import mock
         kit, out = self.tmp / 'kit', self.tmp / 'game'
         src = kit / 'bin' / 'dlssg'
         src.mkdir(parents=True)
         out.mkdir()
-        self.assertEqual(make_launcher.DLSSG_FILES, self.mg.DLSSG_FILES)
+        self.assertEqual(streamline_pin.FILES, self.mg.DLSSG_FILES)
         with mock.patch.object(self.mg, 'KIT', kit):
             for n in self.mg.DLSSG_FILES[:-1]:
                 (src / n).write_bytes(n.encode())
@@ -1675,6 +1675,58 @@ class MakeGameTest(Tmp):
             for n in self.mg.DLSSG_FILES:
                 self.assertEqual((out / n).read_bytes(), (src / n).read_bytes())
             self.assertEqual((out / 'streamline-LICENSE.txt').read_text(), 'MIT')
+
+    def test_streamline_pin(self):
+        """The Streamline files come out of the SDK archive checked one by one; the archive goes once they are out and
+        a filled cache needs no download; an SDK folder on disk must hold the pinned files; bin/dlssg/ gets the set
+        make_game.py places, the two licence texts and a notice with every file's sha256."""
+        import streamline_pin
+        from unittest import mock
+        files = {n: f'{n} of the SDK'.encode() for n in streamline_pin.SDK_FILES}
+        pins = {n: hashlib.sha256(d).hexdigest() for n, d in files.items()}
+        cache = self.tmp / 'dl'
+        cache.mkdir()
+        archive = cache / f'streamline-sdk-v{streamline_pin.VERSION}.zip'
+        with zipfile.ZipFile(archive, 'w') as z:
+            for n, d in files.items():
+                z.writestr(n, d)
+            z.writestr('bin/x64/sl.nis.dll', b'a plugin the game does not load')
+        fetched = []
+
+        def download(url, dest, sha256=None, size=None):   # the archive is already where net.download writes it
+            fetched.append(url)
+            self.assertEqual(Path(dest), archive)
+            return dest
+
+        with mock.patch.dict(streamline_pin.SDK_FILES, pins), mock.patch('launcher.net.download', download):
+            sdk = streamline_pin.resolve(None, cache)
+            self.assertEqual(fetched, [streamline_pin.URL])
+            self.assertFalse(archive.exists())
+            self.assertEqual(streamline_pin.wrong_files(sdk), [])
+            self.assertFalse((sdk / 'bin' / 'x64' / 'sl.nis.dll').exists())
+            self.assertEqual(streamline_pin.resolve(None, cache), sdk)   # filled: no second download
+            self.assertEqual(len(fetched), 1)
+            self.assertEqual(streamline_pin.resolve(sdk, cache), sdk)    # a folder on disk with the pinned files
+            (sdk / 'bin' / 'x64' / 'sl.common.dll').write_bytes(b'another Streamline')
+            with self.assertRaises(SystemExit):
+                streamline_pin.resolve(sdk, cache)
+            (sdk / 'bin' / 'x64' / 'sl.common.dll').write_bytes(files['bin/x64/sl.common.dll'])
+            with zipfile.ZipFile(archive, 'w') as z:                     # an archive whose file differs is refused
+                for n, d in files.items():
+                    z.writestr(n, b'changed' if n == 'license.txt' else d)
+            with self.assertRaises(SystemExit):
+                streamline_pin.extract(archive, self.tmp / 'x')
+            dll = self.tmp / 'nx2navi_dlssg.dll'
+            dll.write_bytes(b'our frame generation shim')
+            dest = self.tmp / 'bin' / 'dlssg'
+            streamline_pin.place(dll, sdk, dest)
+        self.assertEqual(sorted(p.name for p in dest.iterdir()),
+                         sorted((*streamline_pin.FILES, *streamline_pin.TEXTS, streamline_pin.NOTICE)))
+        self.assertEqual((dest / 'streamline-LICENSE.txt').read_bytes(), files['license.txt'])
+        note = (dest / streamline_pin.NOTICE).read_text(encoding='utf-8')
+        self.assertIn(f'Streamline {streamline_pin.VERSION} SDK', note)
+        self.assertIn(f'nx2navi_dlssg.dll sha256 {hashlib.sha256(dll.read_bytes()).hexdigest()}', note)
+        self.assertIn(f'nvngx_dlssg.dll sha256 {pins["bin/x64/nvngx_dlssg.dll"]}', note)
 
     @unittest.skipIf(os.name == 'nt', 'a script stands in for windres.exe')
     def test_compile_resources(self):
@@ -1760,7 +1812,7 @@ class JobTest(Tmp):
         ctx = self.make_ctx('ok')
         j = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline()
         self.assertEqual(j.result, 'ok', j.error)
-        self.assertEqual([s.state for s in j.steps], [jobs.SKIPPED] + [jobs.DONE] * 7)   # tools ... shaders, ready
+        self.assertEqual([s.state for s in j.steps], [jobs.SKIPPED] + [jobs.DONE] * 6 + [jobs.SKIPPED, jobs.DONE])   # tools ... shaders, scan (the fake build has no such step), ready
         self.assertEqual(j.step('check').value, 'Version 1.1.1')
         self.assertTrue(any('working on lift' in ln for ln in j.lines))
         self.assertEqual(j.overall(), 1.0)
@@ -1773,9 +1825,9 @@ class JobTest(Tmp):
         (ctx.layout.app / 'prompt-art').mkdir()
         j = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline()
         self.assertEqual(j.result, 'ok', j.error)
-        self.assertEqual([s.id for s in j.steps][-3:], ['shaders', 'prompts', 'ready'])
+        self.assertEqual([s.id for s in j.steps][-4:], ['shaders', 'prompts', 'scan', 'ready'])
         self.assertEqual(j.step('prompts').state, jobs.DONE)
-        self.assertEqual([s.id for s in jobs.RebuildJob(ctx, self.tmp / 'game').steps][-2:], ['shaders', 'prompts'])
+        self.assertEqual([s.id for s in jobs.RebuildJob(ctx, self.tmp / 'game').steps][-3:], ['shaders', 'prompts', 'scan'])
 
     def test_failed_job(self):
         self.patch_tools()

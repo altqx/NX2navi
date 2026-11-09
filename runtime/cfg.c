@@ -41,8 +41,8 @@ static const char *const known[] = {
     "BIND_ZL", "BIND_ZR", "BLOCK_VIEWS_3D", "CLOTH_REALTIME", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_GAMMA",
     "COLOR_PRESET", "COLOR_SATURATION", "CONTACT_DEBUG", "CONTACT_SHADOWS", "CORE_DIAG", "CRIT", "CRIT_OUT",
     "DESC_TEMPLATE", "DEVICE_PROFILE", "DISCORD_APP_ID", "DISCORD_IMAGE", "DISCORD_RPC", "DLAA", "DLAA_CAM_KEEP", "DLAA_JITTER", "DLAA_MV", "DLAA_MASKDEBUG", "DLAA_MVDEBUG", "DLAA_OBJMV", "DLAA_SURVEY", "DLAA_TIMES", "DLSS", "DLSS_CHAR_MASK", "DLSS_PRESET", "DLSS_REACTIVE", "DUMP", "DUMP_BUF", "DUMP_DIR",
-    "DUMP_LOG", "DUMP_FILE", "DS3", "LOG_CS_BINDS", "LOG_TEX_FLAGS", "LOG_MESH", "MESH", "POOL", "NATIVE_TENSOR", "LOG_RCOND", "LOG_RT_SIZES", "DUMP_WHITE", "DUMP_AFTER", "DUMP_MOVIE", "SUBMIT_FINISH", "ACQUIRE_WAIT", "CS_FALLBACK", "EXEFS", "FEEDBACK", "FIX_C0", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES",
-    "FLIGHT_SPIKE_MS", "FLIGHT_THUMBS", "FLUSH_SPAN", "FLUSH_UPLOAD", "FOLIAGE_SHADOW_CULL", "FOLIAGE_SHADOW_VRS", "FOV", "FOV_PATCH", "FG_HUDLESS_SHOW", "FPS60", "FPS_LIMIT", "FRAMEGEN", "FREEZE_IDLE", "FREE_CORES",
+    "DUMP_LOG", "DUMP_FILE", "DS3", "LOG_CS_BINDS", "LOG_TEX_FLAGS", "LOG_MESH", "MESH", "POOL", "NATIVE_TENSOR", "LOG_RCOND", "LOG_RT_SIZES", "DUMP_WHITE", "DUMP_AFTER", "DUMP_MOVIE", "SUBMIT_FINISH", "ACQUIRE_WAIT", "CRASH_FILTER_GUARD", "CS_FALLBACK", "EXEFS", "FEEDBACK", "FIX_C0", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES",
+    "FLIGHT_SPIKE_MS", "FLIGHT_THUMBS", "FLUSH_SPAN", "FLUSH_UPLOAD", "FOG_CULL", "FOLIAGE_SHADOW_CULL", "FOLIAGE_SHADOW_VRS", "FOV", "FOV_PATCH", "FG_HUDLESS_SHOW", "FPS60", "FPS_LIMIT", "FRAMEGEN", "FRAMEGEN_MULTIPLIER", "FREEZE_IDLE", "FREE_CORES",
     "FULLSCREEN", "FXAA", "GAME_ASPECT", "GAME_RES", "GPA", "GPA_EMPTY", "GPA_TWIN", "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_INDEX", "GPU_PASSES", "GPU_NAME", "HDR", "HDR_BLOWOUT", "HDR_CONTRAST",
     "HDR_EXPOSURE", "HDR_FLARE", "HDR_GAMMA", "HDR_GAME_NITS", "HDR_GRADE", "HDR_HIGHLIGHT_SAT", "HDR_HIGHLIGHTS", "HDR_HUE",
     "HDR_PEAK_NITS", "HDR_SATURATION", "HDR_SHADOWS", "HDR_TONEMAP", "HDR_UI_NITS", "HIGHFPS_FIX", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
@@ -53,14 +53,14 @@ static const char *const known[] = {
     "ONE_PER_CORE", "OPERATION_MODE", "OUTPUT_RES", "PAD_LAYOUT", "PACE_HZ", "PASS_CRUMBS", "PATCH_OUTPUT", "PATCH_RES_FIXED", "PATCH_SCENE", "PATCH_WIDE_ASPECT", "PATCH_WIDE_HUD", "PATCH_WIDE_MOVIE", "PATCH_WIDE_OUT", "PATCH_WIDE_SCENE", "PCSS", "PCSS_K", "PERF_OVERLAY", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPELINE_CACHE_MAX_MB", "PIPE_BINARIES", "PIPE_BINARIES_MAX_MB", "PIPE_FEEDBACK", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT", "POWER_FULL", "TEX_SAME", "PRESENT_HELD", "HELD_SYNC",
     "PREWARM_FULL", "PREWARM_WAIT_MS", "PREWARM_XLATE", "PROBE_MOVIE", "PROBE_MOVIE_SHOT", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES", "PROFILE_REPLAY", "PROFILE_SLOW",
     "PROFILE_MAIN", "PROFILE_RENDER", "PROMPTS", "PUSH_SKIP", "PUSH_STAGE", "RDOC", "RDOC_DIR", "RDOC_DLL", "REALTIME", "REC_END", "REEXEC",
-    "REFLEX", "RENDER_SCALE", "REPLAY_ASYNC", "RTSS",
+    "REFLEX", "RENDER_SCALE", "REPLAY_ASYNC", "RTSS", "RTSS_ENUM", "SCENE_SHARE",
     "REPLAY_CHECK", "RESOLVE_CHECK", "RESTART_WAIT", "ROMFS", "ROMFS_INDEX", "ROMFS_MMAP", "ROMFS_MODS", "ROMFS_PATCHES",
     "ROMFS_PROOF_DIR", "ROMFS_VERIFY", "RSTICK_DEADZONE", "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS", "SHADER_CACHE",
     "SHADER_CACHE_FLUSH", "SHADER_CARRY", "SHADER_MEMO", "SHADOW_COMPARE", "SHADOW_RANGE", "SHADOW_RES", "SHADOW_SCALE", "SHARED_FONTS", "SHARPNESS", "SHOTS", "SHOTS_DIR",
     "SVC_SLOW_MS",
     "SHOTS_FULL", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_IDLE", "SPLIT_IN_PASS", "SPLIT_US", "SPV_OVERRIDE", "STICK_DEADZONE", "STICK_SENS",
     "SWKBD_ANSWER",
-    "SET_AT", "SWKBD_TEST", "TAA", "TEST_PAD", "TEST_PAD_AT", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_MEMO", "TEX_VRAM_PRESSURE", "TEX_RELEASED_MB", "TEX_REUSE", "TEX_COMMIT_FREE_MB", "TEX_EVICT", "TEX_COMMIT_EVICT", "MIRROR_EVICT", "VRAM_BUDGET_MB", "TIMER_1MS", "TRACE", "TXD_TRANSPOSE", "UBO_SNAPSHOT", "UPSCALER", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NOOPT", "VK_NO_FLOAT64",
+    "SET_AT", "SWKBD_TEST", "TAA", "TEST_PAD", "TEST_PAD_AT", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_MEMO", "TEX_VRAM_PRESSURE", "TEX_RELEASED_MB", "TEX_REUSE", "TEX_COMMIT_FREE_MB", "TEX_EVICT", "TEX_COMMIT_EVICT", "MIRROR_EVICT", "VRAM_BUDGET_MB", "TIMER_1MS", "TRACE", "TXD_TRANSPOSE", "UBO_SNAPSHOT", "UPSCALER", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NAN_PRESERVE", "VK_NOOPT", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_RECONVERGE", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VS_OUTS",
     "WALK_KEY", "WALK_SCALE", "WB_EXACT", "WB_FENCE_LIMIT", "WB_MERGE", "WB_NO_REUP", "WB_MERGE_MAX", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_KEEP", "XLATE_PROCS",
     "ZSTD_CHECK", "ZSTD_NATIVE",
@@ -84,6 +84,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"HDR_HIGHLIGHT_SAT", "display"}, {"HDR_BLOWOUT", "display"}, {"HDR_FLARE", "display"}, {"HDR_HUE", "display"},
     {"HDR_GRADE", "display"}, {"SHADOW_RES", "display"},
     {"DLAA", "display"}, {"DLSS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_CHAR_MASK", "display"}, {"FXAA", "display"},
+    {"FRAMEGEN", "display"}, {"FRAMEGEN_MULTIPLIER", "display"},
     {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
     {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
     {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
@@ -113,6 +114,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"BIND_SKIP", "performance"}, {"SHADER_CACHE_FLUSH", "performance"}, {"SHADER_CARRY", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"TEX_MEMO", "performance"}, {"DESC_TEMPLATE", "performance"},
     {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"SPLIT_IDLE", "performance"}, {"SPLIT_IN_PASS", "performance"}, {"SPLIT_US", "performance"}, {"VK_VALIDATION", "performance"},
     {"VK_DYN_VERTEX", "performance"}, {"VK_DYN_A2C", "performance"}, {"VK_SUBGROUP_PIN", "performance"}, {"VK_RECONVERGE", "performance"},
+    {"VK_NAN_PRESERVE", "performance"},
     {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"PASS_CRUMBS", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
     {"WB_FENCE_LIMIT", "diagnostics"}, {"WB_MERGE", "diagnostics"}, {"WB_EXACT", "diagnostics"}, {"MEM_CENSUS", "diagnostics"}, {"WB_NO_REUP", "diagnostics"}, {"FLUSH_UPLOAD", "diagnostics"},
     {"WB_MERGE_MAX", "diagnostics"}, {"MV_SURVEY", "diagnostics"}, {"TEXUP_LOG_MS", "diagnostics"},
@@ -134,6 +136,7 @@ static const CfgMeta metas[] = {
     {"DLAA", "0", "0|1", LIVE}, {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
     {"DLSS_PRESET", "default", "default|k|j", LIVE}, {"TAA", "dlss", "dlss|fsr3", LIVE},   // vk_dlaa.c fsr3
     {"FRAMEGEN", "off", "off|fsr3|dlss", LIVE},   // vk_fg.cpp, vk_dlssg.c
+    {"FRAMEGEN_MULTIPLIER", "2", "2|3|4", LIVE},   // vk_dlssg.c: frames on screen per rendered frame with DLSS
     {"DLSS_CHAR_MASK", "65", "0|35|65|100", LIVE}, {"FXAA", "1", "0|1", LIVE},
     {"GAME_ASPECT", "16:9", "16:9|window|21:9|32:9", RESTART},   // widescreen.c
     {"GAME_RES", "1440", "1080|1440|1800|2160|2880|window", RESTART},   // widescreen.c: the picture's height
@@ -221,6 +224,7 @@ static const CfgMeta metas[] = {
     {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART},
     {"VK_DYN_A2C", "", "0|1", RESTART}, {"VK_SUBGROUP_PIN", "1", "0|1", RESTART},
     {"VK_RECONVERGE", "1", "0|1", RESTART},   // vk_pipeline.c spirv_reconverge
+    {"VK_NAN_PRESERVE", "", "0|1", RESTART},   // vk_pipeline.c spirv_nan_preserve; unset: every driver but NVIDIA's
     {"VK_NOOPT", "0", "0|1", RESTART},   // vk_pipeline.c noopt_flag
     // diagnostics
     {"TRACE", "", NULL, RESTART}, {"FLIGHT", "0", "0|1", RESTART}, {"FLIGHT_SPIKE_MS", "100", "0..60000", RESTART},

@@ -2387,6 +2387,13 @@ static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
     return n;
 }
 
+const VkTexImage *vk_texture_at_locked(const VkTexImage *img, VkFormat format) {
+    for (Tex *p = nvn_hm_get(&by_addr, &((Tex *)img)->key.addr); p; p = p->next_at)
+        if (!p->released && p->pub.format == format && p->pub.width == img->width && p->pub.height == img->height)
+            return &p->pub;
+    return NULL;
+}
+
 // A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
 // tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
 void vk_texture_storage_bound_locked(const VkTexImage *img) {

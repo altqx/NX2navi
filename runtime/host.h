@@ -151,6 +151,7 @@ typedef struct { uint64_t base, size; uint32_t state, attr, perm, ipc, device, p
 void mem_init(void);                                       // reserve every region; on a collision re-run the process
                                                            // (up to 20 times, NX2NAVI_REEXEC), then fatal
 const RtGuestLayout *mem_layout(void);
+void mem_guest_census(uint64_t frame);   // NX2NAVI_TRACE=perf: committed bytes per guest region
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr);                      // 0x01
 uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm);             // 0x02
 uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at); // 0x03
@@ -316,6 +317,8 @@ int ov_movie_live(void);                                   // ov_movie2.c: a mov
 int frame_limit_adjustable(void);                         // the frame limit setting changes the rate (always)
 int frame_free_running(void);                             // no fps60/realtime patch set: the game steps by the clock
 double frame_step_limit_hz(void);                         // the frame rate the limit gives (overlay); 0 unknown
+double frame_step_game_hz(void);                          // ... over frame generation's factor: the game's rate
+int frame_limit_follows_display(void);                    // no limit set and frame generation in use: the display's rate
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
 void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none, -1 keep RTSS out
 int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer holds no frames
@@ -365,3 +368,4 @@ int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // 
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
+int vk_pipeline_spirv_selftest(void);                      // vk_pipeline.c: --selftest, the SPIR-V rewrites without a device

@@ -609,6 +609,14 @@ static int raw_9e5(VkImage img, VkFormat f) {
     return 0;
 }
 
+// The image written as raw RGB9E5 words this frame at t's place in memory, NULL when none was. The picture also resolves
+// as an RGB9E5 texture there: a VkImage of its own that nothing renders into, stale or never initialised. Looked up live
+// (texture lock held), as an image noted in RAW may be gone by now.
+static const VkTexImage *raw_9e5_twin(const VkTexImage *t) {
+    const VkTexImage *o = vk_texture_at_locked(t, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    return o && raw_9e5(o->image, o->format) ? o : NULL;
+}
+
 // vk_dump.c: 1 when img was written as raw RGB9E5 words this frame (dump it decoded as such).
 int vk_exec_raw_9e5(VkImage img, VkFormat f) { return raw_9e5(img, f); }
 
@@ -4567,9 +4575,10 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
         // RGBA8 sources (the movie's frames; its 10-bit intermediates gave black bands), or one in the output's own
         // format: the 3D scene (r11g11b10f) the game's upscaler enlarges to the output resolution
         int rgba8 = t && (t->format == VK_FORMAT_R8G8B8A8_UNORM || t->format == VK_FORMAT_R8G8B8A8_SRGB);
-        // The picture also resolves as RGB9E5 at the same address. Refused for its format, the next input of its size
-        // (the older picture the upscaler blends with) stood in for it, and what moves trailed.
-        int same = t && (t->format == dst->format || fallback_9e5_scene(t->format, dst->format));
+        // The picture also resolves as RGB9E5 at the same address; what the post pass wrote there stands in for it below.
+        // Refused for its format, the next input of its size (the older picture the upscaler blends with) was shown, and
+        // what moves trailed.
+        int same = t && (t->format == dst->format || (fallback_9e5_scene(t->format, dst->format) && raw_9e5_twin(t)));
         if (t && (rgba8 || same) && t->image != dst->image && t->aspect == VK_IMAGE_ASPECT_COLOR_BIT && t->type == VK_IMAGE_TYPE_2D &&
             t->samples == 1 && t->width <= dst->width && t->height <= dst->height && t->width >= 16 && t->height >= 16 &&
             (!src || (uint64_t)t->width * t->height > (uint64_t)src->width * src->height))
@@ -4592,16 +4601,20 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
         }
     }
     VkImage si = src ? src->image : VK_NULL_HANDLE, di = dst ? dst->image : VK_NULL_HANDLE;
+    VkFormat sf = src ? src->format : VK_FORMAT_UNDEFINED;
+    if (src && dst && fallback_9e5_scene(sf, dst->format)) {
+        const VkTexImage *twin = raw_9e5_twin(src);
+        si = twin ? twin->image : VK_NULL_HANDLE, sf = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    }
     VkImageView dst_view = VK_NULL_HANDLE;   // for the tonemap pass, while the lock keeps the image
-    if (src && dst && (dst->usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
-        (raw_9e5(src->image, src->format) || fallback_9e5_scene(src->format, dst->format)) &&
+    if (src && dst && (dst->usage & VK_IMAGE_USAGE_STORAGE_BIT) && raw_9e5(si, sf) &&
         dst->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && knob_tm_dispatch() != 2) {
         view_t nv;
         memset(&nv, 0, sizeof nv);
         dst_view = get_view(ex, dst, &nv, 0, 3, 1);   // 3: the translator's Texture2D
     }
     uint32_t sw = src ? src->width : 0, sh = src ? src->height : 0, dw = dst ? dst->width : 0, dh = dst ? dst->height : 0;
-    VkFormat sf = src ? src->format : VK_FORMAT_UNDEFINED, df = dst ? dst->format : VK_FORMAT_UNDEFINED;
+    VkFormat df = dst ? dst->format : VK_FORMAT_UNDEFINED;
     vk_texture_unlock();
     if (!si || !di) return;
     static int logged;
@@ -4621,8 +4634,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
         e5_blit = (fp.optimalTilingFeatures & need) == need ? 1 + !!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) : 0;
         rt_log("vk_exec: RGB9E5 fallback decode %s", e5_blit ? "on" : "unavailable (E5B9G9R9 is no blit source here)");
     }
-    VkImage e5 = !scratch && e5_blit && (raw_9e5(si, sf) || fallback_9e5_scene(sf, df))
-                     ? fallback_scratch(ex, sw, sh, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) : VK_NULL_HANDLE;
+    VkImage e5 = !scratch && e5_blit && raw_9e5(si, sf) ? fallback_scratch(ex, sw, sh, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) : VK_NULL_HANDLE;
     if (e5) {   // the raw words into a shared-exponent image (same texel size: a copy keeps the bits), then the blit
         VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                           .extent = {sw, sh, 1}};

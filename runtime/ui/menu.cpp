@@ -52,6 +52,7 @@ extern "C" {
 #include "sysinfo.h"
 #include "ui/menu.h"
 #include "ui_text.h"
+#include "vk_dlssg.h"
 // host.h and vk.h pull in cpu.h, which is C only: the functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
@@ -63,8 +64,8 @@ const char *const *vk_color_preset(const char *name);
 int vk_hdr_wanted(void);
 int vk_hdr_active(void);
 int vk_dlaa_needs_restart(void);
-int vk_dlssg_wanted(void);
 double frame_step_limit_hz(void);
+int frame_limit_follows_display(void);
 int frame_limit_adjustable(void);
 int rtss_limit_state(void);
 int frame_free_running(void);
@@ -711,7 +712,8 @@ static void row_game_lang(void) {
     opt_choice_list("NX2NAVI_LANG", UI_MENU_GAME_LANG, vals, names, n + 1, UI_MENU_GAME_LANG_DESC, cur);
 }
 
-// The frame limit (frame_rate.c): unset, the older fps60 = 0 still means 30. The monitor choice shows the rate it gives.
+// The frame limit (frame_rate.c): unset, the older fps60 = 0 still means 30, and frame generation in use means the
+// monitor's rate (frame_limit_follows_display), which the row then shows. The monitor choice shows the rate it gives.
 // The note says when RivaTuner Statistics Server does the limiting (rtss_limit.c), cannot change its profile, or let the
 // game run past its limit.
 static void row_fps_limit() {
@@ -732,7 +734,7 @@ static void row_fps_limit() {
         names[9] = display;
     }
     const char *set = cfg_get("NX2NAVI_FPS_LIMIT"), *old = cfg_get("NX2NAVI_FPS60");
-    int cur = (!set || !*set) && old && !strcmp(old, "0") ? 0 : -1;
+    int cur = (!set || !*set) && old && !strcmp(old, "0") ? 0 : frame_limit_follows_display() ? 9 : -1;
     int rtss = rtss_limit_state();
     const char *note = rtss == 1   ? menu_text(UI_MENU_FPS_RTSS)
                        : rtss == 2 ? menu_text(UI_MENU_FPS_RTSS_READONLY)
@@ -882,11 +884,32 @@ static void row_hdr(void) {
     opt_slider("NX2NAVI_HDR_GRADE", UI_MENU_HDR_GRADE, 0, 100, UI_MENU_HDR_GRADE_DESC, 5, "%.0f %%");
 }
 
+// DLSS frame generation's multiplier (NX2NAVI_FRAMEGEN_MULTIPLIER, vk_dlssg.c, at once): 2x, 3x or 4x as far as this
+// GPU and driver allow (vk_dlssg_multiplier_max, from Streamline). While DLSS's frame generation runs, the row lists only
+// those and shows the value in effect, a higher setting clamped to it, with a note saying why the rest are missing;
+// before the restart that starts it, or before Streamline reported its limit, it lists all three. Left out while it is
+// set but does not run: the frame generation row says why.
+static void row_framegen_mult(bool restart) {
+    if (!restart && !vk_dlssg_active()) return;
+    int old_dll = 0, max = restart ? 0 : vk_dlssg_multiplier_max(&old_dll);
+    const char *note = nullptr;
+    static char upto[64];
+    if (max == 2) note = menu_text(old_dll ? UI_MENU_FRAMEGEN_MULT_OLD_DLL : UI_MENU_FRAMEGEN_MULT_RTX50);
+    else if (max == 3) snprintf(upto, sizeof upto, menu_text(UI_MENU_FRAMEGEN_MULT_UPTO), max), note = upto;
+    if (!max) max = 4;   // not known yet: every multiplier, the setting as it is
+    static const char *const values[] = {"2", "3", "4"};
+    static const char *const names[] = {"2x", "3x", "4x"};
+    int n = max - 1, cur = vk_dlssg_multiplier_of(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), max, nullptr) - 2;
+    int nv = opt_choice_index("NX2NAVI_FRAMEGEN_MULTIPLIER", UI_MENU_FRAMEGEN_MULT, names, n, cur, 0,
+                              UI_MENU_FRAMEGEN_MULT_DESC, note);
+    if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FRAMEGEN_MULTIPLIER", values[nv]);
+}
+
 // Frame generation (vk_fg.cpp, at once; NVIDIA's after a restart); it needs a temporal upscaler's motion vectors
 static void row_framegen(void) {
     // the generated frames are made from DLSS's or FSR 3.1's motion vectors: without one of them it would do nothing
-    const bool dlss = dlss_offered();
-    if (!cfg_bool("NX2NAVI_DLAA")) opt_disable_next(dlss ? UI_MENU_FRAMEGEN_NEEDS : UI_MENU_FRAMEGEN_NEEDS_FSR);
+    const bool dlss = dlss_offered(), upscaled = cfg_bool("NX2NAVI_DLAA");
+    if (!upscaled) opt_disable_next(dlss ? UI_MENU_FRAMEGEN_NEEDS : UI_MENU_FRAMEGEN_NEEDS_FSR);
     static const char *const values[] = {"off", "fsr3", "dlss"};
     const char *names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), "AMD FSR 3.1", "NVIDIA DLSS"};
     const char *v = cfg_value("NX2NAVI_FRAMEGEN");
@@ -896,10 +919,15 @@ static void row_framegen(void) {
     int n = dlss || cur == 2 ? 3 : 2;
     // AMD's follows the setting; NVIDIA's is set up with the device, so only a change to or from it waits for a restart
     const bool restart = dlss && (cur == 2) != (vk_dlssg_wanted() != 0);
+    UiTextId note = restart ? UI_MENU_AFTER_RESTART : dlss ? UI_MENU_FRAMEGEN_NOTE : UI_MENU_FRAMEGEN_NOTE_FSR;
+    // NVIDIA's set since the start but not running: "in use: off" and why (vk_dlssg_status; the log has the details)
+    const int st = cur == 2 && !restart ? vk_dlssg_status() : DLSSG_RUNS;
+    if (st == DLSSG_NO_GPU) note = UI_MENU_FRAMEGEN_OFF_GPU;
+    else if (st == DLSSG_NO_FILES) note = UI_MENU_FRAMEGEN_OFF_FILES;
     int nv = opt_choice_index("NX2NAVI_FRAMEGEN", UI_MENU_FRAMEGEN, names, n, cur, 0,
-                              dlss ? UI_MENU_FRAMEGEN_DESC : UI_MENU_FRAMEGEN_DESC_FSR,
-                              menu_text(restart ? UI_MENU_AFTER_RESTART : dlss ? UI_MENU_FRAMEGEN_NOTE : UI_MENU_FRAMEGEN_NOTE_FSR));
+                              dlss ? UI_MENU_FRAMEGEN_DESC : UI_MENU_FRAMEGEN_DESC_FSR, menu_text(note));
     if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FRAMEGEN", values[nv]);
+    else if (cur == 2 && upscaled && dlss) row_framegen_mult(restart);
 }
 
 // The picture's height (widescreen.c picture_height): 1080, the game's 1440 or more.
@@ -1381,6 +1409,9 @@ static void perf_picture(const MenuTarget *t, PerfPanel *p) {
     snprintf(v[8], sizeof v[8], "%s", menu_text(!strcmp(hdr, "native") ? UI_MENU_HDR_NATIVE : cfg_bool("NX2NAVI_HDR") ? UI_MENU_HDR_TONEMAPPED : UI_MENU_FRAMEGEN_OFF));
     const char *fg = cfg_value("NX2NAVI_FRAMEGEN");
     snprintf(v[9], sizeof v[9], "%s", !strcmp(fg, "fsr3") ? "AMD FSR 3.1" : !strcmp(fg, "dlss") ? "NVIDIA DLSS" : menu_text(UI_MENU_FRAMEGEN_OFF));
+    if (!strcmp(fg, "dlss") && vk_dlssg_active())   // its multiplier as set, clamped to what this GPU allows
+        snprintf(v[9], sizeof v[9], "NVIDIA DLSS %dx",
+                 vk_dlssg_multiplier_of(cfg_value("NX2NAVI_FRAMEGEN_MULTIPLIER"), vk_dlssg_multiplier_max(nullptr), nullptr));
     // The 3D scene's size is known only where resolution.c sets it (the builds with its patch sets); Ocarina sizes its
     // own scene dynamically and res_sizes would report a fixed 1600x900, so the line is left out
     p->scene_known = res_adjustable() != 0;

@@ -1007,6 +1007,21 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     _set_invalid_parameter_handler(invalid_parameter);
 }
 
+// The last-chance filter is set once, at the start, before the GPU driver, the window and audio libraries and the
+// movie decoder load. A DLL that sets its own filter later takes the place of crash_filter, and a fault outside this
+// executable then ends the process with no line in the log. This puts crash_filter back; when another filter had
+// taken its place, `who` gets the module and offset of that filter and the call returns 1.
+int plat_crash_filter_reassert(char *who, size_t n) {
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(crash_filter);
+    if (prev == crash_filter) return 0;
+    void *base = NULL;
+    if (prev) RtlPcToFileHeader((void *)prev, &base);
+    if (!prev) snprintf(who, n, "no filter (removed)");
+    else if (!base) snprintf(who, n, "%p, outside every module", (void *)prev);
+    else snprintf(who, n, "%s+%#llx", image_name(base), (unsigned long long)((uintptr_t)prev - (uintptr_t)base));
+    return 1;
+}
+
 // A fresh process gets a fresh layout: Windows places DLLs, heaps and thread stacks at random addresses. The parent
 // waits and exits with the child's code.
 void plat_reexec(void) {

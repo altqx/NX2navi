@@ -521,6 +521,17 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
+    [UI_MENU_FRAMEGEN_MULT] = "DLSS multiplier",
+    [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
+                                   "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "
+                                   "the frames on screen, so the game draws the limit divided by this: set the limit "
+                                   "to your display's rate. 2x needs a GeForce RTX 40 GPU or newer, 3x and 4x an RTX "
+                                   "50.",
+    [UI_MENU_FRAMEGEN_MULT_RTX50] = "3x and 4x need an RTX 50 GPU",
+    [UI_MENU_FRAMEGEN_MULT_UPTO] = "up to %dx on this GPU and driver",
+    [UI_MENU_FRAMEGEN_MULT_OLD_DLL] = "2x only: update the DLSS frame generation files",
+    [UI_MENU_FRAMEGEN_OFF_GPU] = "in use: off, needs an RTX 40 GPU or newer",
+    [UI_MENU_FRAMEGEN_OFF_FILES] = "in use: off, its files are missing",
     [UI_MENU_GAME_RES] = "Resolution",
     [UI_MENU_GAME_RES_DESC] = "Height of the game's picture. Higher is sharper but costs more GPU power.",
     [UI_MENU_GAME_RES_NATIVE] = "Native",

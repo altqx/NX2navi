@@ -10,6 +10,7 @@
 #include "input.h"
 #include "input_map.h"
 #include "platform/platform.h"
+#include "vk_dlssg.h"
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL cfg: %s\n", what); } } while (0)
@@ -161,6 +162,24 @@ int probe_cfg(void) {
     CHECK(m && EQ(m->def, "default") && m->values == NULL && !m->live, "meta: audio_device is free text, default, needs a restart");
     CHECK(cfg_meta("BIND_A") == NULL && cfg_meta("FPS_COUNTER") == NULL && cfg_meta("NO_SUCH") == NULL,
           "meta: keys the menu does not show are NULL");
+    m = cfg_meta("FRAMEGEN_MULTIPLIER");
+    CHECK(m && EQ(m->def, "2") && EQ(m->values, "2|3|4") && m->live, "meta: framegen_multiplier is 2|3|4, 2 by default, live");
+
+    // DLSS frame generation's multiplier (vk_dlssg.c): the setting clamped to what the GPU and driver allow, with the
+    // reason vk_dlssg_frame logs when it is not taken as it is
+    const char *why = "";
+    CHECK(vk_dlssg_multiplier_of("3", 4, &why) == 3 && !why, "multiplier: 3 where 4x runs");
+    CHECK(vk_dlssg_multiplier_of("4x", 4, &why) == 4 && !why, "multiplier: 4x reads as 4");
+    CHECK(vk_dlssg_multiplier_of("4", 2, &why) == 2 && why, "multiplier: 4 where 2x is the most is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("4", 3, &why) == 3 && why, "multiplier: 4 where 3x is the most is 3, with a reason");
+    CHECK(vk_dlssg_multiplier_of("9", 0, &why) == 4 && why, "multiplier: above 4 is 4, with a reason");
+    CHECK(vk_dlssg_multiplier_of("1", 4, &why) == 2 && why, "multiplier: below 2 is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("fast", 4, &why) == 2 && why, "multiplier: not a number is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("3y", 4, &why) == 2 && why, "multiplier: a number with other text after it is 2");
+    CHECK(vk_dlssg_multiplier_of("", 3, &why) == 2 && !why && vk_dlssg_multiplier_of(NULL, 3, NULL) == 2,
+          "multiplier: unset is 2");
+    CHECK(vk_dlssg_multiplier_of("4", 0, &why) == 4 && !why, "multiplier: kept as it is while the GPU's limit is not known");
+    CHECK(vk_dlssg_multiplier_max(NULL) == 0 && vk_dlssg_multiplier() == 1, "multiplier: 1, no limit, while DLSS-G does not run");
 
     // cfg_reset: the key's active lines leave nx2navi.ini, the commented example stays
     static const char rbase[] = "[audio]\n# volume = 100\n[input]\nmotion = 0\n";

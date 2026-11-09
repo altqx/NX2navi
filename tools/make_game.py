@@ -24,7 +24,10 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
               from it into <out>/romfs-patches-* (the Controls menu's Button prompts loads them), the keys as the
               bind_ lines of <out>/nx2navi.ini give them. Its key names everything it reads (the RomFS, the art, the
               tools, those lines), so it runs again only when one of them changed or a folder is gone, and running
-              it makes no other step run again. It is last: a failure here leaves the game and its shaders complete.
+              it makes no other step run again. A failure here leaves the game and its shaders complete.
+  8. scan     tools/romfs_check.py decompresses every file of the game data once, writes <out>/romfs-check.json and
+              makes stand-ins for damaged textures in <out>/mods. Its key names the game files and the tool, and it
+              is last: nothing of it runs while the game does.
               Without art the step is skipped and the game shows its own prompts, as before
 
 The exefs and romfs steps depend only on the game files; lift and compile depend on this kit's code too. A newer kit
@@ -82,14 +85,15 @@ EXEFS_FILES = ('main', 'main.npdm', 'sdk', 'subsdk0', 'rtld')
 MODULES = ('main', 'sdk', 'subsdk0', 'rtld')
 ALIGN = 16
 STATE_VERSION = 2
-STEPS = ('exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts')
+STEPS = ('exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts', 'scan')
 # Steps whose key names every input they read rather than the step before them: a step before them that runs does
 # not make them run again, and they make no step after them run again.
-OWN_KEY_STEPS = ('prompts',)
+OWN_KEY_STEPS = ('prompts', 'scan')
 # The Python packages tools/pad_prompts.py imports (pip name: import name), checked before a build with button art.
 PROMPT_PACKAGES = {'zstandard': 'zstandard', 'fonttools': 'fontTools', 'pillow': 'PIL'}
 # The line tools/pad_prompts.py prints for each overlay folder it wrote.
 PROMPTS_WRITTEN = re.compile(r'^.+: \d+ files, the font grew by -?\d+ bytes$')
+SCAN_CHECKED = re.compile(r'^checked (\d+) of (\d+)$')   # tools/romfs_check.py's progress lines
 
 # Bring-up fixes in the lifted SDK, each anchored on exact generated text that must occur once.
 LIFT_FIXES = [
@@ -1001,8 +1005,46 @@ def windres_command(msys, rco):
             *(f'--preprocessor-arg={a}' for a in pp), '-O', 'coff', '-i', 'nx2navi.rc', '-o', str(rco)]
 
 
-def compile_resources(msys, rt, obj, env):
-    """runtime/nx2navi.rc into obj/nx2navi_rc.o: the manifest of the game's exe (per-monitor DPI awareness, so the
+RC_LINE = re.compile(r'(\d+)\s+(24|ICON)\s+"([^"]+)"')
+
+
+def resource_file(rt):
+    """runtime/nx2navi.rc as a .res file (the format Windows' resource compiler writes): the manifest as resource 24,
+    the icon's images as RT_ICON 1..n and their directory as RT_GROUP_ICON, US English as windres gives them. lld
+    takes a .res among its inputs and builds the exe's resource section from it.
+
+    Python writes it, so no tool opens a path by the system's ANSI code page: windres does (binutils), and a build
+    folder or a user folder whose name holds a character outside that code page (C:\\Users\\Víctor on a Cyrillic or a
+    Japanese Windows, D:\\Games\\Zelda：Ocarina) failed with "Invalid argument" or "Cannot create temporary file"."""
+    def resource(typ, name, data, flags):
+        head = struct.pack('<HHHHIHHII', 0xffff, typ, 0xffff, name, 0, flags, 0x0409, 0, 0)
+        return struct.pack('<II', len(data), 8 + len(head)) + head + data + b'\0' * (-len(data) % 4)
+
+    out = bytearray(struct.pack('<II', 0, 32) + struct.pack('<HHHHIHHII', 0xffff, 0, 0xffff, 0, 0, 0, 0, 0, 0))
+    for line in (rt / 'nx2navi.rc').read_text(encoding='utf-8').splitlines():
+        m = RC_LINE.fullmatch(line.strip())
+        if not m:
+            continue
+        name, kind, data = int(m.group(1)), m.group(2), (rt / m.group(3)).read_bytes()
+        if kind == '24':
+            out += resource(24, name, data, 0x1030)
+            continue
+        reserved, ico_type, n = struct.unpack_from('<HHH', data, 0)
+        if reserved or ico_type != 1 or not n:
+            fail(f'runtime/{m.group(3)} is not an icon file')
+        group = struct.pack('<HHH', 0, 1, n)
+        for i in range(n):
+            w, h, colors, res0, planes, bits, size, off = struct.unpack_from('<BBBBHHII', data, 6 + 16 * i)
+            out += resource(3, i + 1, data[off:off + size], 0x1010)
+            group += struct.pack('<BBBBHHIH', w, h, colors, res0, planes, bits, size, i + 1)
+        out += resource(14, name, group, 0x1030)
+    return bytes(out)
+
+
+def compile_resources(msys, rt, obj, env, lld=False):
+    """With lld (lld=True) obj/nx2navi.res written by resource_file, which lld links in itself; else windres below.
+
+    runtime/nx2navi.rc into obj/nx2navi_rc.o: the manifest of the game's exe (per-monitor DPI awareness, so the
     picture keeps the monitor's real size rather than one Windows stretches) and its icon.
 
     windres preprocesses the .rc with gcc through one command line it writes itself, quoting each path that holds a
@@ -1019,6 +1061,12 @@ def compile_resources(msys, rt, obj, env):
 
     The object is written under another name and replaces the old one only when its bytes differ, so an unchanged
     resource keeps its time and does not make the link key change (a rebuild with nothing new does not link again)."""
+    if lld:
+        res = obj / 'nx2navi.res'
+        data = resource_file(rt)
+        if not res.is_file() or res.read_bytes() != data:   # same bytes: keep the time, so the link key holds
+            res.write_bytes(data)
+        return res
     rco, new = obj / 'nx2navi_rc.o', obj / 'nx2navi_rc.o.new'
     tmp = obj / 'windres-tmp'
     shutil.rmtree(tmp, ignore_errors=True)
@@ -1168,7 +1216,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         fail(f'{len(bad)} files did not compile')
     (obj / LIFTED_BUILD).write_text(json.dumps({'level': level}), encoding='utf-8')   # lifted_level reads it next update
 
-    objs = [o for _, o in srcs] + ([compile_resources(msys, rt, obj, env)] if WIN else [])
+    objs = [o for _, o in srcs] + ([compile_resources(msys, rt, obj, env, lld=(msys / 'bin' / 'ld.lld.exe').is_file())]
+                                   if WIN else [])
     exe = out / EXE_NAME
     rsp = cache_dir / 'link.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for o in objs), encoding='utf-8')
@@ -1457,6 +1506,30 @@ def cpu_tag():
         return 'any'
 
 
+def step_scan(out):
+    """Every file of the game data decompressed once, and stand-ins made for the damaged textures: tools/romfs_check.py,
+    in worker threads here, so nothing of it runs while the game does."""
+    proc = subprocess.Popen(py_cmd(KIT / 'tools' / 'romfs_check.py', '--game', out),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                            errors='replace', bufsize=1)
+    emit('progress', step='scan', fraction=0.0, detail='Checking the game files')
+    try:
+        for line in proc.stdout:
+            line = line.rstrip('\n')
+            m = SCAN_CHECKED.match(line)
+            if m:
+                emit('progress', step='scan', fraction=round(int(m[1]) / max(int(m[2]), 1), 4),
+                     detail=f'Checked {m[1]} of {m[2]} files')
+            else:
+                say(f'  {line}')
+    finally:
+        rc = proc.wait()
+        proc.stdout.close()
+    if rc:
+        fail('checking the game files failed (the lines above say why); the game still runs. Run the build again to '
+             'retry this step')
+
+
 def step_key(step, identity, out=None):
     """What a step's output depends on. exefs and romfs: the game files only; lift: the unpacked ExeFS and the
     lifter; compile: the lift, the runtime sources, this script and the processor (cpu_tag); prompts: the game files,
@@ -1464,6 +1537,10 @@ def step_key(step, identity, out=None):
     is still there."""
     if step in ('exefs', 'romfs'):
         return f'{step}-1|{identity}'
+    if step == 'scan':
+        written = 'written' if (out / 'romfs-check.json').is_file() else 'missing'
+        tool = KIT / 'tools' / 'romfs_check.py'
+        return f'scan-1|{identity}|{sha256_file(tool) if tool.is_file() else "no tool"}|{written}'
     if step == 'prompts':
         tools = tree_digest(KIT / 'tools', ('pad_prompts.py', 'prompt_art.py', 'button_icons.py'))
         binds = sha256_bytes(json.dumps(bind_lines(out)).encode())
@@ -1555,7 +1632,8 @@ def main():
     runs = {'exefs': lambda: step_exefs(src, out), 'romfs': lambda: step_romfs(src, out, min(a.jobs, 8)),
             'lift': lambda: step_lift(out, cache),
             'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job, a.rebuild and not a.retune),
-            'shaders': lambda: step_shaders(out, a.rebuild), 'prompts': lambda: step_prompts(out)}
+            'shaders': lambda: step_shaders(out, a.rebuild), 'prompts': lambda: step_prompts(out),
+            'scan': lambda: step_scan(out)}
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
 
     def save():
@@ -1597,7 +1675,7 @@ def main():
                             state['steps'].pop(later, None)
                 say(f'{name}:')
                 emit('step', step=name, state='start')
-                if name in ('shaders', 'prompts') and romfs_job:   # they read the RomFS image
+                if name in ('shaders', 'prompts', 'scan') and romfs_job:   # they read the RomFS image
                     romfs_job.join()
                 if name == 'romfs' and a.until != 'romfs':
                     # The RomFS image is mostly disk work, the lift and the compile are processor work: they run side

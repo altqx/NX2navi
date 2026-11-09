@@ -14,6 +14,9 @@
 # 36 do, while 60 does not. vk_present = immediate shows a frame as soon as it is presented, without this quantisation,
 # at the cost of tearing. A monitor running with variable refresh (FreeSync, G-Sync) follows the frames instead, so
 # there any limit inside its range is even.
+# With frame generation on (framegen, [display]) the limit counts the frames on screen, generated ones included: the
+# game draws the limit divided by the multiplier. Unset, the limit is then the monitor's refresh rate instead of 60, so
+# at 4x on a 165 Hz monitor the game draws about 41 fps and the screen shows 165; a limit set here is kept as it is.
 # fps_limit = 60
 # Where RivaTuner Statistics Server is installed and running, the limit goes into its profile for the game's
 # executable and RTSS does the limiting instead of the game; closing the game puts back what the profile held.
@@ -21,6 +24,9 @@
 # it, or with frame generation on, the game limits by itself, and also when RTSS's own frame counter shows the game
 # well past the limit (RTSS then hooks the game without holding it back). rtss = 0 always leaves it to the game.
 # rtss = 1
+# 1: asks RTSS's EnumProfiles whether the game's profile exists, instead of looking for its file. EnumProfiles crashes
+# the game (RTSS keeps a pointer of the game's in 32 bits); only for testing an RTSS that fixed it.
+# rtss_enum = 0
 # Older key, read only while fps_limit is unset: fps60 = 0 means a limit of 30.
 # fps60 = 1
 # Real-time frame step: game speed follows the clock instead of the frame count.
@@ -195,6 +201,11 @@
 # Keep a shader's threads together after divergent code where the game's shaders expect it (maximal reconvergence,
 # when the driver supports it). 0 turns it off; leaves then go missing from the foliage's colour pass.
 # vk_reconverge = 1
+# Ask the GPU driver to keep NaN, infinity and signed zero in the game's shader maths as the Switch does, 0 or 1.
+# Without it a driver may assume they never occur. The AMD symptoms it is for: Navi drawn without her orb (only her
+# sparkles), black and white blocks on her and on Link, shadows blown up. Default: on, except on NVIDIA's driver,
+# which keeps them anyway; 1 also asks NVIDIA's driver. The first start after a change compiles the pipelines again.
+# vk_nan_preserve = 1
 
 [display]
 # Device profile: auto (the Steam Deck when this is one), desktop or deck. On a Steam Deck the keys this file does not
@@ -305,6 +316,20 @@
 # The game's own FXAA after the post effects; with DLAA on it is not needed. Changes while the game runs take effect at
 # once.
 # fxaa = 1
+# Frame generation: off, fsr3 (AMD FSR 3.1 on any GPU: one generated frame between every two the game draws, the HUD
+# kept out of it) or dlss (NVIDIA DLSS Frame Generation on GeForce RTX 40 and 50 GPUs, paced with Reflex; it needs
+# nx2navi_dlssg.dll and NVIDIA Streamline's files next to the executable, which the setup puts there). Both need DLSS or
+# FSR 3.1 upscaling (dlaa = 1). While frame generation runs, fps_limit counts the frames on screen, generated ones
+# included: the game draws the limit divided by the multiplier (2 for fsr3). With fps_limit unset it is the display's
+# rate.
+# fsr3 takes effect at once, dlss (on or off) at the next start.
+# framegen = off
+# DLSS frame generation's multiplier: the frames on screen for each frame the game draws, 2, 3 or 4 (one, two or three
+# generated). 2 needs an RTX 40 GPU or newer, 3 and 4 an RTX 50 and a current driver. A value above what the GPU and
+# driver allow (Streamline reports it) is lowered to that, with a line in the log; the menu offers only what they allow.
+# Each step adds a little latency, and on a 60 Hz display 4 leaves the game drawing 15 fps. Changes while the game runs
+# take effect at once.
+# framegen_multiplier = 2
 
 # HDR output: hdr = 1 sends the picture as HDR10 through the HDR tone mapper, hdr = native as the game renders it in
 # its own HDR mode (both need HDR on in Windows, "Use HDR", or a Wayland compositor with colour management; without it
@@ -500,6 +525,10 @@
 # last one it finished. Unset: on AMD GPUs (VK_AMD_buffer_marker). 1: also on NVIDIA GPUs
 # (VK_NV_device_diagnostic_checkpoints), which NVIDIA says costs a little. 0: off.
 # pass_crumbs = 1
+# Once a second, puts the crash report's exception filter back if a GPU driver or an overlay loaded after the start set
+# its own in its place, and says so in the log. Without it, a crash in such a DLL can end the game with no FATAL line in
+# the log. 0: off.
+# crash_filter_guard = 1
 # Render targets up to this size (bytes, 0 to 1073741824) go back to their game memory whenever the game waits for a
 # GPU fence. A larger target goes back too unless the GPU drew it in each of the last 16 frames. A game that reads a
 # larger target drawn every frame without invalidating it sees stale bytes at the default. With trace = gfx the log

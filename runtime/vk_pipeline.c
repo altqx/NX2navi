@@ -63,6 +63,8 @@ enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SP
 
 // ---- device capabilities and the pipeline cache (set up on first use, under P.lock)
 
+enum { NP_16 = 1, NP_32 = 2, NP_64 = 4 };   // float widths in P.nan_preserve and spirv_nan_preserve
+
 static struct {
     PlatMutex lock;
     volatile int32_t ready;
@@ -82,6 +84,7 @@ static struct {
     int pv_last;                       // provokingVertexLast enabled: NVN's default is the last vertex
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
     int reconverge;                    // modules with subgroup ops get MaximallyReconvergesKHR (spirv_reconverge)
+    uint32_t nan_preserve;             // float widths that get SignedZeroInfNanPreserve (spirv_nan_preserve): NP_16|NP_32|NP_64
     VkDynamicState dyn[32];
     uint32_t n_dyn;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -498,12 +501,27 @@ static void pb_log(const char *when) {
 // Vk*PipelineCreateInfo. With binaries on: from the stored binaries of its pipeline key when there are any, else
 // compiled with P.cache and its binaries captured. The create info is restored before returning.
 typedef struct { VkStructureType sType; const void *pNext; VkPipelineCreateFlags flags; } PipeCiHead;
+
+// Builds into P.cache against reads of its data. Every create with P.cache holds this shared (pipe_create_in); the
+// copy of the data in cache_save holds it exclusively and only takes it when no build is running. The Vulkan rules
+// allow reading a cache created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT while pipelines are
+// built into it, but Intel's Windows driver (101.8991 on an Arc 140V) crashed inside vkGetPipelineCacheData during the
+// copy, reading through a null entry, with compute and library builds running beside the autosave.
+static PlatMutex cache_rw = PLAT_MUTEX_INIT;
+
+static VkResult pipe_create_in(int kind, void *ci, VkPipeline *pipe, VkPipelineCache cache) {
+    if (cache) plat_mutex_lock_shared(&cache_rw);
+    VkResult r = kind == 2 ? vkCreateComputePipelines(P.device, cache, 1, ci, NULL, pipe)
+                           : vkCreateGraphicsPipelines(P.device, cache, 1, ci, NULL, pipe);
+    if (cache) plat_mutex_unlock_shared(&cache_rw);
+    return r;
+}
+
 static VkResult pipe_create(int kind, void *ci, VkPipeline *pipe) {
     PipeCiHead *hd = ci;
     VkResult r;
     pb_last = 0;
-#define PIPE_CREATE(cache) (kind == 2 ? vkCreateComputePipelines(P.device, cache, 1, ci, NULL, pipe) \
-                                      : vkCreateGraphicsPipelines(P.device, cache, 1, ci, NULL, pipe))
+#define PIPE_CREATE(cache) pipe_create_in(kind, ci, pipe, cache)
     if (!PB.on) return PIPE_CREATE(P.cache);
     VkPipelineCreateInfoKHR kci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR, .pNext = ci};
     VkPipelineBinaryKeyKHR key = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
@@ -607,6 +625,29 @@ static void cache_load(VkCtx *c) {
                kept / 1048576.0);
 }
 
+// The float widths spirv_nan_preserve declares on this device (P.nan_preserve), from NX2NAVI_VK_NAN_PRESERVE: 0 off,
+// 1 on every driver; unset, on every driver except NVIDIA's own, on which the game draws right without it. Only widths
+// the driver can preserve (VkPhysicalDeviceFloatControlsProperties) are declared, and nothing without 32-bit floats.
+static void nan_preserve_init(VkCtx *c) {
+    VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceFloatControlsProperties fc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES,
+                                                  .pNext = &drv};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &fc};
+    vkGetPhysicalDeviceProperties2(c->phys, &p2);
+    const char *e = cfg_get("NX2NAVI_VK_NAN_PRESERVE");   // no fixed default: it depends on the driver, see above
+    int set = e && *e, want = set ? strcmp(e, "0") != 0 : drv.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+    uint32_t can = (fc.shaderSignedZeroInfNanPreserveFloat16 ? NP_16 : 0) |
+                   (fc.shaderSignedZeroInfNanPreserveFloat32 ? NP_32 : 0) |
+                   (fc.shaderSignedZeroInfNanPreserveFloat64 ? NP_64 : 0);
+    P.nan_preserve = want && (can & NP_32) ? can : 0;
+    if (P.nan_preserve)
+        rt_log("vk_pipeline: game shaders keep NaN, infinity and signed zero (SignedZeroInfNanPreserve for %s32%s-bit "
+               "floats%s)", can & NP_16 ? "16, " : "", can & NP_64 ? ", 64" : "", set ? ", NX2NAVI_VK_NAN_PRESERVE=1" : "");
+    else
+        rt_log("vk_pipeline: game shaders without SignedZeroInfNanPreserve (%s)",
+               !want ? (set ? "NX2NAVI_VK_NAN_PRESERVE=0" : "NVIDIA's driver") : "the driver cannot keep them in 32-bit floats");
+}
+
 static void keys_open(void);
 static void prebuild_start(void);
 
@@ -658,6 +699,7 @@ static int ensure_init(void) {
     P.reconverge = c->has_maximal_reconvergence && rt_knob("VK_RECONVERGE", "1") == 1;
     rt_log("vk_pipeline: maximal reconvergence for shaders with subgroup ops: %s",
            P.reconverge ? "on" : c->has_maximal_reconvergence ? "off (NX2NAVI_VK_RECONVERGE=0)" : "not supported by the driver");
+    nan_preserve_init(c);
     P.f_full_subgroups = v13.computeFullSubgroups;
     P.cache_control = v13.pipelineCreationCacheControl;
     // Pipeline creation feedback is core in Vulkan 1.3; the driver reports per pipeline whether P.cache held it.
@@ -1326,6 +1368,119 @@ static uint32_t *spirv_reconverge(const uint32_t *w, uint64_t n, uint64_t *out_n
     return o;
 }
 
+// Maxwell computes in IEEE 754, and the game's shaders rely on it: its compiler writes an unordered comparison as
+// `x > c || isnan(x)`, a normalisation of a zero-length vector gives an infinity that a later comparison sorts out, and
+// integer masks such as 0xffffffff travel through float moves and selects. The translator's own guards are isnan
+// tests as well (fragment outputs, min, max and clamp). Without the SignedZeroInfNanPreserve execution mode, SPIR-V
+// lets the driver assume that no float is NaN or infinite, and AMD's compilers act on it: on an RX 9070 XT a select
+// between 1 and the bits 0xffffffff, converted to float as a signed integer, gave 2^32 instead of -1 and blew the
+// shadow casters up into huge triangles (issue #156); RX 6000 cards drew Navi, and Link's skin next to her, with black
+// and white blocks (#41, #110); and AMD GPUs drew Navi's sparkles but not her orb, whose light sits at her own centre.
+// NVIDIA's driver keeps the IEEE results without the mode. This adds the capability, the extension (the translator
+// writes SPIR-V 1.3) and the mode for each entry point: 32-bit floats always, 16-bit and 64-bit ones where the module
+// declares Float16 or Float64 and `widths` (NP_*) allows them. NULL: nothing to change (the module has the mode, or no
+// 32-bit width is allowed, or no memory).
+static uint32_t *spirv_nan_preserve(const uint32_t *w, uint64_t n, uint32_t widths, uint64_t *out_n) {
+    enum { OP_EXTENSION = 10, OP_EXECUTION_MODE = 16, OP_CAPABILITY = 17, CAP_FLOAT16 = 9, CAP_FLOAT64 = 10,
+           CAP_PRESERVE = 4466, MODE_PRESERVE = 4461 };
+    static const char ext[] = "SPV_KHR_float_controls";
+    const uint32_t ext_words = (uint32_t)(sizeof ext + 3) / 4;   // the string with its terminating zero, padded
+    if (n < 5 || !(widths & NP_32)) return NULL;
+    uint64_t caps_end = 0, eps_end = 0;
+    uint32_t eps[16], neps = 0, use = NP_32;
+    int has_cap = 0, has_ext = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        if (!l || i + l > n) return NULL;
+        if (op == OP_CAPABILITY && l >= 2) {
+            caps_end = i + l;
+            if (w[i + 1] == CAP_FLOAT16) use |= NP_16;
+            else if (w[i + 1] == CAP_FLOAT64) use |= NP_64;
+            else if (w[i + 1] == CAP_PRESERVE) has_cap = 1;
+        } else if (op == OP_EXTENSION && (l - 1) * 4 >= sizeof ext && !memcmp(w + i + 1, ext, sizeof ext)) {
+            has_ext = 1;
+        } else if (op == SPV_OP_ENTRY_POINT && l >= 3) {
+            if (neps == 16) return NULL;
+            eps[neps++] = w[i + 2], eps_end = i + l;
+        } else if (op == OP_EXECUTION_MODE && l >= 3 && w[i + 2] == MODE_PRESERVE) {
+            return NULL;
+        } else if (op == SPV_OP_FUNCTION) {
+            break;
+        }
+        i += l;
+    }
+    if (!caps_end || !neps || eps_end < caps_end) return NULL;
+    use &= widths;
+    uint32_t nw = 0, width[3];
+    if (use & NP_16) width[nw++] = 16;
+    width[nw++] = 32;
+    if (use & NP_64) width[nw++] = 64;
+    uint64_t on = n + (has_cap ? 0 : 2) + (has_ext ? 0 : 1 + ext_words) + 4ull * nw * neps;
+    uint32_t *o = malloc(on * 4);
+    if (!o) return NULL;
+    uint64_t p = 0;
+    memcpy(o, w, caps_end * 4), p = caps_end;
+    if (!has_cap) o[p++] = 2u << 16 | OP_CAPABILITY, o[p++] = CAP_PRESERVE;
+    if (!has_ext) {
+        o[p++] = (1 + ext_words) << 16 | OP_EXTENSION;
+        memset(o + p, 0, ext_words * 4);
+        memcpy(o + p, ext, sizeof ext), p += ext_words;
+    }
+    memcpy(o + p, w + caps_end, (eps_end - caps_end) * 4), p += eps_end - caps_end;
+    for (uint32_t k = 0; k < neps; k++)
+        for (uint32_t j = 0; j < nw; j++)
+            o[p++] = 4u << 16 | OP_EXECUTION_MODE, o[p++] = eps[k], o[p++] = MODE_PRESERVE, o[p++] = width[j];
+    memcpy(o + p, w + eps_end, (n - eps_end) * 4), p += n - eps_end;
+    *out_n = p;
+    return o;
+}
+
+// --selftest (main.c): spirv_nan_preserve on a small fragment module, without a device. Returns the number of failures.
+int vk_pipeline_spirv_selftest(void) {
+    enum { CAP = 2u << 16 | 17, MODE = 4u << 16 | 16 };
+    static const uint32_t head[] = {0x07230203, 0x00010300, 0, 5, 0, CAP, 1, CAP, 10};   // Shader, Float64
+    static const uint32_t body[] = {
+        3u << 16 | 14, 0, 1,                     // OpMemoryModel Logical GLSL450
+        5u << 16 | 15, 4, 1, 0x6e69616d, 0,      // OpEntryPoint Fragment %1 "main"
+        3u << 16 | 16, 1, 7,                     // OpExecutionMode %1 OriginUpperLeft
+        2u << 16 | 19, 2,                        // %2 = OpTypeVoid
+        3u << 16 | 33, 3, 2,                     // %3 = OpTypeFunction %2
+        5u << 16 | 54, 2, 1, 0, 3,               // %1 = OpFunction %2 None %3
+        2u << 16 | 248, 4, 1u << 16 | 253, 1u << 16 | 56};   // OpLabel, OpReturn, OpFunctionEnd
+    enum { NH = sizeof head / 4, NB = sizeof body / 4, EP_END = 8 };   // EP_END: body words up to the entry point's end
+    uint32_t in[NH + NB], want[NH + NB + 32];
+    memcpy(in, head, sizeof head), memcpy(in + NH, body, sizeof body);
+    int failures = 0;
+    // widths: what the device allows; f64: the module declares Float64; w64: a 64-bit mode is expected
+    for (int t = 0; t < 3; t++) {
+        uint32_t widths = t == 0 ? NP_16 | NP_32 | NP_64 : NP_32, n = NH + NB, p = 0;
+        int f64 = t != 2, w64 = t == 0;
+        if (!f64) in[NH - 1] = 0;   // Matrix in place of Float64
+        memcpy(want, in, NH * 4), p = NH;
+        want[p++] = CAP, want[p++] = 4466;
+        want[p++] = 7u << 16 | 10;
+        memset(want + p, 0, 24), memcpy(want + p, "SPV_KHR_float_controls", 23), p += 6;
+        memcpy(want + p, body, EP_END * 4), p += EP_END;
+        want[p++] = MODE, want[p++] = 1, want[p++] = 4461, want[p++] = 32;
+        if (w64) want[p++] = MODE, want[p++] = 1, want[p++] = 4461, want[p++] = 64;
+        memcpy(want + p, body + EP_END, (NB - EP_END) * 4), p += NB - EP_END;
+        uint64_t on = 0, again_n = 0;
+        uint32_t *o = spirv_nan_preserve(in, n, widths, &on);
+        uint32_t *again = o ? spirv_nan_preserve(o, on, widths, &again_n) : NULL;
+        if (!o || on != p || memcmp(o, want, p * 4) || again) {
+            printf("spirv: SignedZeroInfNanPreserve rewrite, case %d: wrong output\n", t);
+            failures++;
+        }
+        free(o), free(again);
+    }
+    if (spirv_nan_preserve(in, NH + NB, NP_16 | NP_64, &(uint64_t){0})) {
+        printf("spirv: SignedZeroInfNanPreserve rewrite: a module changed without the 32-bit width\n");
+        failures++;
+    }
+    printf("spirv: SignedZeroInfNanPreserve rewrite: %s\n", failures ? "FAIL" : "ok");
+    return failures;
+}
+
 // Chain {size 32} into a stage create info when the stage uses subgroup ops and the driver allows the pin.
 static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *rq,
                            const uint32_t *w, uint64_t words) {
@@ -1416,6 +1571,12 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
     if (rc) {
         free(fixed);
         w = fixed = rc, words = rc_n;
+    }
+    uint64_t np_n = 0;
+    uint32_t *np = P.nan_preserve ? spirv_nan_preserve(w, words, P.nan_preserve, &np_n) : NULL;
+    if (np) {
+        free(fixed);
+        w = fixed = np, words = np_n;
     }
     if (P.feedback >= 2) mm_hash = fnv(FNV0, w, (size_t)words * 4);
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
@@ -2489,7 +2650,8 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
 // shaders (gfx_shader_get results) live for the process (gfx_shader_drop_memory is the shader probe's, which builds no
 // pipelines), layouts until vk_pipeline_shutdown, which drains the queue first. Workers call vkCreateGraphicsPipelines
 // without P.lock: P.cache is created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so the driver
-// synchronises it, vkGetPipelineCacheData in vk_pipeline_save included. Compute pipelines stay synchronous: a skipped
+// synchronises builds into it; only the copy of its data in cache_save is kept apart from them (cache_rw). Compute
+// pipelines stay synchronous: a skipped
 // dispatch can change what the game computes.
 //
 // Two queues: draws' misses (A.head) and the boot prebuild (A.low, see "pipeline keys" below). Workers take the low
@@ -3462,6 +3624,89 @@ static uint32_t *spv_override(const uint32_t *code, uint64_t words, uint64_t *ou
     return w;
 }
 
+// A skipped froxel's exit in the fog's first compute pass: the block at word at (an OpLabel) makes five image writes, four
+// of (0,0,0,1) and last the mask value (1/255,0,0,0), and returns.
+static int fog_skip_block(const uint32_t *w, uint64_t n, uint64_t at, const uint64_t *def, uint32_t bound) {
+    int writes = 0;
+    for (uint64_t i = at + (w[at] >> 16); i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) return 0;
+        if (op == 253) return writes == 5;              // OpReturn
+        if (op == 248 || op == 249 || op == 250) return 0;   // OpLabel, OpBranch, OpBranchConditional
+        if (op == 99) {                                 // OpImageWrite
+            if (len < 4 || w[i + 3] >= bound || ++writes > 5) return 0;
+            uint64_t c = def[w[i + 3]];
+            if (!c || (w[c] & 0xffff) != 80 || w[c] >> 16 != 7) return 0;   // OpCompositeConstruct of four
+            float v[4];
+            for (int k = 0; k < 4; k++) {
+                uint32_t id = w[c + 3 + k];
+                uint64_t f = id < bound ? def[id] : 0;
+                if (!f || (w[f] & 0xffff) != 43 || w[f] >> 16 != 4) return 0;   // OpConstant of one word
+                memcpy(&v[k], &w[f + 3], 4);
+            }
+            if (writes == 5 ? !(v[0] > 0.0039f && v[0] < 0.0040f && v[1] == 0 && v[2] == 0 && v[3] == 0)
+                            : !(v[0] == 0 && v[1] == 0 && v[2] == 0 && v[3] == 1)) return 0;
+        }
+        i += len;
+    }
+    return 0;
+}
+
+// The volumetric fog's first compute pass skips a froxel behind a coarse depth table and writes it as empty, and the next
+// pass's mask keeps it empty. That table comes from the frame before, so in the columns a near object has just left, every
+// froxel past the object's old depth came out with no fog: a dark block of the fog grid beside the object, which the fog's
+// history then smeared into a trail, and worst at the screen edges, where near objects move fastest. A froxel behind
+// today's depth is never seen, so computing it only costs a little time: the comparison is made never true (x > x).
+// Returns the patched copy of that shader, NULL for any other. Found by its shape rather than a hash, so it holds across
+// translator updates: a branch whose other side is that exit, taken on !(distance > table) || flag.
+// NX2NAVI_FOG_CULL=1 keeps the game's skip.
+static uint32_t *spirv_fog_keep_froxels(const uint32_t *w, uint64_t n) {
+    const char *e = cfg_get("NX2NAVI_FOG_CULL");
+    if (n < 6 || (e && !strcmp(e, "1"))) return NULL;
+    uint32_t bound = w[3];
+    int writes = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t len = w[i] >> 16;
+        if (!len || i + len > n) return NULL;
+        writes += (w[i] & 0xffff) == 99;
+        i += len;
+    }
+    if (writes < 5) return NULL;
+    uint64_t *def = calloc(bound, sizeof *def);   // word of each id's definition, for the instructions looked at below
+    if (!def) return NULL;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == 248 && len >= 2 && w[i + 1] < bound) def[w[i + 1]] = i;   // OpLabel
+        else if ((op == 43 || op == 80 || op == 166 || op == 168 || op == 186) && len >= 3 && w[i + 2] < bound) def[w[i + 2]] = i;
+        i += len;
+    }
+    uint64_t cmp = 0, prev = 0;
+    int found = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == 250 && len >= 4 && prev && (w[prev] & 0xffff) == 247 && w[prev + 1] == w[i + 3] && w[i + 1] < bound &&
+            w[i + 3] < bound && def[w[i + 3]] && fog_skip_block(w, n, def[w[i + 3]], def, bound)) {   // OpSelectionMerge just before
+            uint64_t c = def[w[i + 1]];
+            for (int k = 0; c && (w[c] & 0xffff) == 166 && k < 2; k++) {                              // OpLogicalOr
+                uint32_t a = w[c + 3 + k];
+                uint64_t no = a < bound ? def[a] : 0;
+                if (!no || (w[no] & 0xffff) != 168 || w[no + 3] >= bound) continue;                  // OpLogicalNot
+                uint64_t gt = def[w[no + 3]];
+                if (gt && (w[gt] & 0xffff) == 186) cmp = gt, found++;                                // OpFOrdGreaterThan
+            }
+        }
+        prev = i;
+        i += len;
+    }
+    free(def);
+    uint32_t *o = found == 1 ? malloc(n * 4) : NULL;
+    if (!o) return NULL;
+    memcpy(o, w, n * 4);
+    o[cmp + 4] = o[cmp + 3];
+    LOG_ONCE("vk_pipeline: fog: froxels behind last frame's depth are computed too");
+    return o;
+}
+
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
 // cached_only (needs P.cache_control): from P.cache or the driver's own disk cache, never compiled; VK_NULL_HANDLE when
 // neither holds it (the driver returns VK_PIPELINE_COMPILE_REQUIRED, a success code, with no pipeline).
@@ -3471,6 +3716,8 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
     uint64_t ow = 0;
     uint32_t *over = spv_override(code, words, &ow);
     if (over) code = over, words = ow;
+    uint32_t *fog = spirv_fog_keep_froxels(code, words);
+    if (fog) free(over), over = fog, code = fog;
     VkShaderModule m = make_module(code, words);
     if (!m) return free(over), VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
@@ -4511,7 +4758,50 @@ void vk_pipeline_stats(VkPipeStats *s) {
 
 static PlatMutex save_lock = PLAT_MUTEX_INIT;   // one cache save at a time; shutdown takes it to destroy the cache
 
-void vk_pipeline_save(void) {
+// Copies P.cache's data into pipeline-cache.bin, with cache_rw held exclusively for the copy only (not the file write).
+// The lock is only ever tried, never waited for: a waiting exclusive request would hold back every new build
+// (a shared request queues behind it), so a pending save could stall the replay. wait_ms: how long to keep trying
+// while builds run (0: one try). Returns 0 when no build-free moment came, 1 otherwise (saved, or nothing to save).
+static int cache_save(uint32_t wait_ms) {
+    if (!P.ready || !P.cache || !P.cache_path[0]) return 1;
+    // Not under P.lock: holding P.lock through the copy and the file write (about 60 ms on the 1.4.3 fight) stopped
+    // every pipeline lookup of the replay, a freeze at each 20 s autosave.
+    plat_mutex_lock(&save_lock);
+    if (!P.cache) {   // vk_pipeline_shutdown destroyed it
+        plat_mutex_unlock(&save_lock);
+        return 1;
+    }
+    uint64_t until = plat_now_ms() + wait_ms;
+    while (!plat_mutex_trylock(&cache_rw)) {
+        if (plat_now_ms() >= until) {
+            plat_mutex_unlock(&save_lock);
+            return 0;
+        }
+        plat_sleep_ms(2);
+    }
+    size_t size = 0;
+    void *data = NULL;
+    int got = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
+              vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS;
+    plat_mutex_unlock(&cache_rw);
+    if (got) {
+        if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
+        else if (P.feedback) {
+            char when[96];
+            snprintf(when, sizeof when, "at a save of %.1f MB (%+.1f MB since the boot)", size / 1048576.0,
+                     ((double)size - (double)P.cache_loaded) / 1048576.0);
+            fb_log(when);
+        }
+    }
+    free(data);
+    plat_mutex_unlock(&save_lock);
+    return 1;
+}
+
+// Builds still running after this long at a save that waits (exit, the shader preparation) leave the file as it was.
+#define SAVE_WAIT_MS 5000
+
+static void save_with(uint32_t wait_ms) {
     if (P.ready) keys_flush(), pb_flush();
     if (P.ready && P.gpl) {
         rt_log("vk_pipeline: gpl: %llu fast links (%llu by workers; avg %.2f ms, max %.2f ms, %llu failed), %llu draws "
@@ -4539,28 +4829,13 @@ void vk_pipeline_save(void) {
     }
     gfx_shader_record_flush(1);
     if (P.ready && !P.cache) pb_log("at a save");   // with P.cache the line comes with its own save below
-    if (!P.ready || !P.cache || !P.cache_path[0]) return;
-    // Not under P.lock: the driver synchronises P.cache, and holding P.lock through the copy and the file write (about
-    // 60 ms on the 1.4.3 fight) stopped every pipeline lookup of the replay, a freeze at each 20 s autosave.
-    plat_mutex_lock(&save_lock);
-    if (!P.cache) {   // vk_pipeline_shutdown destroyed it
-        plat_mutex_unlock(&save_lock);
-        return;
-    }
-    size_t size = 0;
-    void *data = NULL;
-    if (vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
-        vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS) {
-        if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
-        else if (P.feedback) {
-            char when[96];
-            snprintf(when, sizeof when, "at a save of %.1f MB (%+.1f MB since the boot)", size / 1048576.0,
-                     ((double)size - (double)P.cache_loaded) / 1048576.0);
-            fb_log(when);
-        }
-    }
-    free(data);
-    plat_mutex_unlock(&save_lock);
+    if (!cache_save(wait_ms) && wait_ms)
+        rt_log("vk_pipeline: %s not saved: pipeline builds kept running for %u ms", P.cache_path, (unsigned)wait_ms);
+}
+
+// The save at exit and after the shader preparation: it waits up to SAVE_WAIT_MS for a moment with no build running.
+void vk_pipeline_save(void) {
+    save_with(SAVE_WAIT_MS);
 }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
@@ -4579,8 +4854,14 @@ static void autosave_once(void) {
     VkPipeStats s;
     vk_pipeline_stats(&s);
     if (s.graphics + s.compute == last_n) return;
+    // Only at a moment with no build running (cache_save): while one runs the save waits for the next tick, 500 ms
+    // on, before it logs or flushes anything, so a busy stretch does not repeat the statistics lines every tick.
+    if (P.cache && P.cache_path[0]) {
+        if (!plat_mutex_trylock(&cache_rw)) return;
+        plat_mutex_unlock(&cache_rw);
+    }
     last_n = s.graphics + s.compute, last_ms = now;
-    vk_pipeline_save();
+    save_with(0);
 }
 
 // On its own thread: the save (vkGetPipelineCacheData and the file write, about 60 ms) and the key appends (a flush to

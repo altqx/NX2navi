@@ -108,8 +108,10 @@ beside the game.
   "Preparing shaders" once while the driver rebuilds them. With a driver that has Vulkan's graphics pipeline library
   it lasts at most about 20 seconds once the shaders are translated, and the remaining pipelines are built in the
   background while you play.
-- **Screen** in the menu has Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (FSR 3.1; it
-  needs DLSS or FSR 3.1 upscaling on), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the
+- **Screen** in the menu has Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
+  on RTX 40 and 50 cards, with a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card; it needs
+  DLSS or FSR 3.1 upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the
+  display's refresh rate), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the
   resolution. Those marked "after restart" take effect when the game starts again.
 - **Controls** in the menu has Button prompts: the game's own, or Xbox, PlayStation or keyboard and mouse ones when
   the build drew them (a kit with `prompt-art`). It takes effect after a restart. The keyboard and mouse prompts show
@@ -118,6 +120,9 @@ beside the game.
 - The build copies NVIDIA's DLSS library `nvngx_dlss.dll` (with `nvngx_dlss-NOTICE.txt`, which names its licence)
   and FSR 3.1's `amd_fidelityfx_vk.dll` beside `ocarina.exe` from the kit's `bin\`. To use another DLSS version, put
   your own `nvngx_dlss.dll` there: later builds keep it.
+- A kit with `bin\dlssg\` (made with `tools/make_kit.py --dlssg`) also brings DLSS Frame Generation on GeForce RTX 40
+  and 50 cards: the build copies `nx2navi_dlssg.dll`, NVIDIA Streamline's runtime, `nvngx_dlssg.dll` and their licence
+  texts beside `ocarina.exe`, and Frame generation in the Screen menu then offers DLSS too.
 - Logs are in `logs\`. When reporting a problem, say where you were in the game and which graphics card you have, and
   attach `logs\nx2navi.log`. Never send game files.
 

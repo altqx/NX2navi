@@ -23,6 +23,7 @@ __attribute__((weak)) int prof_sampler_start(void) {
 __attribute__((weak)) void prof_sampler_write(void) {}
 __attribute__((weak)) void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) { (void)frame, (void)now, (void)d; }
 __attribute__((weak)) void prof_commit_census(uint64_t frame) { (void)frame; }
+__attribute__((weak)) void mem_guest_census(uint64_t frame) { (void)frame; }
 
 // NX2NAVI_TRACE=perf, NX2NAVI_FLIGHT=1 or the full performance overlay: event counts are taken. Wait times are always taken
 // (frame-time summary). perf_base: the part fixed at start.
@@ -448,7 +449,8 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
     static int census_on = -1;
     static uint64_t census_prv;
     if (census_on < 0) census_on = cfg_bool("NX2NAVI_MEM_CENSUS");
-    if (census_on && (frame % 3600 == 0 || prv >= census_prv + (1ull << 30))) prof_commit_census(frame), census_prv = prv;
+    if (census_on && (frame % 3600 == 0 || prv >= census_prv + (1ull << 30)))
+        prof_commit_census(frame), mem_guest_census(frame), census_prv = prv;
     if (g.have_gpu && g.have_idle)
         rt_log("perf: frame %llu: gpu idle per frame %.2f ms between timed parts: %.2f ms waiting for the next submission, "
                "%.2f ms with it queued (untimed work or waits); %.1f gaps over 0.5 ms, longest %.2f ms; submit to start avg %.2f ms",
@@ -498,8 +500,24 @@ static void cpu_placement(void) {
     plat_process_affinity(on ? one : all);
 }
 
+// NX2NAVI_CRASH_FILTER_GUARD (default 1; 0 off): once a second, the crash report's last-chance exception filter is put
+// back if a DLL loaded after the start (a GPU driver, an overlay) set its own in its place. Without it, a fault in such
+// a DLL ends the process with no FATAL line in the log. The first eight replacements are logged with the module.
+static void crash_filter_guard(uint64_t frame) {
+    static int on = -1, logged;
+    if (on < 0) on = rt_knob("CRASH_FILTER_GUARD", "1");
+    if (!on || frame % 60) return;
+    char who[160];
+    if (plat_crash_filter_reassert(who, sizeof who) && logged < 8) {
+        logged++;
+        rt_log("diag: frame %llu: an exception filter from %s had replaced the crash report's; the crash report's is "
+               "back (NX2NAVI_CRASH_FILTER_GUARD)", (unsigned long long)frame, who);
+    }
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
+    crash_filter_guard(frame);
     static int64_t win_prev[PERF_CNT_N];
     prof_render_tid = plat_thread_id();
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);

@@ -94,6 +94,20 @@ static double dlss_share(void) {
          : !strcmp(m, "ultra_performance") ? 1.0 / 3 : 1.0;
 }
 
+// Without DLSS or FSR 3.1 (FSR 1, bilinear) the game's dynamic resolution took the scene down to a third of the picture
+// under load, and a plain scale shows every step of that. The most the game's controller ever gives (wide_init) is held.
+#define PLAIN_SHARE 0.75
+
+static double scene_share(void) {
+    static double plain = -1;
+    if (plain < 0) {
+        const char *e = cfg_get("NX2NAVI_SCENE_SHARE");   // 0: the game's dynamic resolution, as with no share at all
+        plain = e && *e ? atof(e) : PLAIN_SHARE;
+    }
+    double s = dlss_share();
+    return s > 0 ? s : plain;
+}
+
 // The game turns the scale at +240 into a scene size against its own 1440-line picture (a 2160-line picture at 1.0
 // gave a 1440-line scene), so the share goes there times the picture's height over 1440: wide_init sets it.
 static double scale_k = 1.0;
@@ -107,21 +121,14 @@ void wide_present(void) {
     unsigned v = cfg_version();
     if (v != seen) {
         seen = v;
-        float s = (float)dlss_share(), page_s = (float)(s * scale_k);
+        float s = (float)scene_share(), page_s = (float)(s * scale_k);
         if (s > 0) memcpy((uint8_t *)rt_patch_page() + 240, &page_s, 4);
-        if (s <= 0 && rt_patch_enabled(set)) {
-            rt_patch_switch(set, 0);
-            rt_log("widescreen: DLSS off: the game's own render scale again");
-        } else if (s > 0 && rt_patch_enabled(set)) {
-            rt_log("widescreen: DLSS render scale %.0f%% of the picture", s * 100);
-        }
+        if (s <= 0 && rt_patch_enabled(set)) rt_patch_switch(set, 0);
+        else if (rt_patch_enabled(set)) rt_log("widescreen: render scale %.0f%% of the picture", s * 100);
     }
-    if (++presents == RES_FIXED_AFTER && dlss_share() > 0) {
+    if (++presents == RES_FIXED_AFTER && scene_share() > 0) {
         rt_patch_switch(set, 1);
-        rt_log("widescreen: DLSS render scale %.0f%% of the picture (the game's dynamic resolution off)", dlss_share() * 100);
-    } else if (presents > RES_FIXED_AFTER && dlss_share() > 0 && !rt_patch_enabled(set)) {
-        rt_patch_switch(set, 1);   // DLSS switched on later in the run
-        rt_log("widescreen: DLSS on again: render scale %.0f%% of the picture", dlss_share() * 100);
+        rt_log("widescreen: render scale %.0f%% of the picture (the game's dynamic resolution off)", scene_share() * 100);
     }
 }
 

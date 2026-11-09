@@ -1051,6 +1051,7 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 }
 
 void plat_crash_context(const char *s) { (void)s; }   // the Windows crash notes only
+int plat_crash_filter_reassert(char *who, size_t n) { (void)who, (void)n; return 0; }   // Windows only
 
 // plat_jmp_save / plat_jmp_go (platform.h): leaf code that does not move rsp before it leaves, as on Windows.
 _Static_assert(sizeof(PlatJmp) == 72 && __builtin_offsetof(PlatJmp, mxcsr) == 64, "plat_jmp_save layout");

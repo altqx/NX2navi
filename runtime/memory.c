@@ -708,3 +708,30 @@ void mem_kernel_free(void *p, uint64_t size) {
     kfree_list[k] = f;
     plat_mutex_unlock(&klock);
 }
+
+// NX2NAVI_TRACE=perf: how many bytes of each guest region are committed, so a process that has grown says which region
+// holds the memory. A region is reserved whole at start-up and committed page by page, so the walk reads each run of
+// pages of the same state; the alias window is the largest and costs the most steps when it is full.
+void mem_guest_census(uint64_t frame) {
+    const RtGuestLayout *g = mem_layout();
+    const struct { const char *name; RtRange r; } reg[] = {
+        {"aslr", g->aslr}, {"stack", g->stack}, {"heap", g->heap},
+        {"alias", g->alias}, {"kernel", g->kernel}, {"hostfn", g->hostfn},
+    };
+    char line[400];
+    int o = snprintf(line, sizeof line, "mem: guest regions at frame %llu (MiB committed):",
+                     (unsigned long long)frame);
+    uint64_t all = 0;
+    for (unsigned i = 0; i < sizeof reg / sizeof *reg && o < (int)sizeof line - 40; i++) {
+        uint64_t x = reg[i].r.base, end = reg[i].r.base + reg[i].r.size, committed = 0, b = 0;
+        while (x < end) {
+            int st = plat_mem_state(x, end, &b);
+            if (b <= x) break;
+            if (st >= 0) committed += b - x;   // a PLAT_PROT_* state: these pages are committed
+            x = b;
+        }
+        all += committed;
+        o += snprintf(line + o, sizeof line - o, " %s %.0f", reg[i].name, committed / 1048576.0);
+    }
+    rt_log("%s; all %.0f", line, all / 1048576.0);
+}

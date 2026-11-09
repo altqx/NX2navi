@@ -86,6 +86,44 @@ def free_gb(path):
         return 0.0
 
 
+# Exit codes that end the game without a line of its own in its log, and what they mean. The game's crash report exits
+# with 71 after writing its FATAL lines (runtime/main.c crash_handler); the others come from Windows when something
+# ends the process before or around that report.
+EXIT_CODES = {
+    70: 'the game could not start itself again',
+    71: 'the crash report ended the game',
+    0xC0000005: 'access violation',
+    0xC00000FD: 'stack overflow',
+    0xC0000142: 'a DLL failed to start',
+    0xC0000374: 'heap corruption',
+    0xC0000409: 'fail-fast: a security check or abort ended the process without an exception',
+    0xC0000417: 'invalid parameter to a C runtime function',
+    0xC000041D: 'a fault inside a Windows callback',
+    0xE06D7363: 'a C++ exception no one caught',
+}
+
+
+def exit_code_text(code):
+    """The exit code as the game's log and Windows show it: hex for a Windows status, with its meaning when known."""
+    code &= 0xFFFFFFFF
+    meaning = EXIT_CODES.get(code)
+    shown = f'0x{code:08X}' if code >= 0x80000000 else str(code)
+    return f'{shown} ({meaning})' if meaning else shown
+
+
+def note_exit_in_log(game_dir, text):
+    """Adds the exit code to the end of the game's log, so a log a player sends shows how the run ended even when the
+    process died before it could write a line itself."""
+    if not game_dir:
+        return
+    log = Path(game_dir) / 'logs' / 'nx2navi.log'
+    try:
+        with open(log, 'a', encoding='utf-8') as f:
+            f.write(f'[launcher] the game ended with code {text} at {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+    except OSError:
+        pass
+
+
 def drive_of(path):
     return Path(path).anchor.rstrip('\\/') or str(Path(path).parent)
 
@@ -870,8 +908,10 @@ class App:
         self.root.deiconify()
         self.root.lift()
         if code not in (0, None):
-            self.ctx.log(f'the game ended with code {code}')
-            self.message = f'The game ended with code {code}. Its log is logs\\nx2navi.log in the game folder.'
+            text = exit_code_text(code)
+            self.ctx.log(f'the game ended with code {text}')
+            self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
+            note_exit_in_log(self.game_dir(), text)
         if self.install_staged('the game exited'):
             return
         self.show('home', self.focus)
@@ -1082,7 +1122,7 @@ class App:
         return {'tools': 'Gathering Build Tools', 'tools_update': 'Updating Build Tools', 'check': 'Inspecting Your Game',
                 'exefs': 'Unpacking the Program', 'romfs': 'Packing the Game Data', 'lift': 'Translating the Code',
                 'compile': 'Compiling', 'compile_changed': 'Compiling Changed Files', 'shaders': 'Preparing the Shaders',
-                'prompts': 'Drawing the Button Prompts', 'ready': 'Ready to Play',
+                'prompts': 'Drawing the Button Prompts', 'scan': 'Checking the Game Files', 'ready': 'Ready to Play',
                 'download': 'Downloading', 'verify': 'Verifying', 'swap': 'Swapping In the New Build'}.get(st.id,
                                                                                                          st.label)
 
