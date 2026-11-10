@@ -54,6 +54,8 @@ const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8
                                   const GfxShaderAnswers *a);
 uint64_t gfx_shader_async_done(void);                      // translations finished by the background worker
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys in memory, translations done (NX2NAVI_TRACE=perf)
+void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   // disk cache reads on the render
+                                                     // thread (count, ns) and by the loaders (gfx_shader.c load_budget)
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs.
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
                          int bda);
@@ -143,6 +145,9 @@ typedef struct {
     uint64_t (*submit)(const uint64_t *handles, int n);    // replays; returns this submission's fence value
                                                            // (gfx_submit_queue names the game's queue)
     int  (*fence_wait)(uint64_t value, uint64_t timeout_ns);   // 1 reached; caller has given its core up
+    // As fence_wait, but only until the GPU has executed the submission's own commands: its write-backs to guest
+    // memory and its fence's side effects may follow (vk_sync.c exec_tl). The same as fence_wait where there is no split.
+    int  (*exec_wait)(uint64_t value, uint64_t timeout_ns);
     uint64_t (*fence_done)(void);                          // highest value whose side effects are written
     // Queues the present and returns at once; the host present goes out at at_ns (kern_now_ns clock), at once when that
     // has passed or at_ns is 0.

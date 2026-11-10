@@ -952,7 +952,7 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
 
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).
 enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FLOAT = 22, OP_TYPE_VECTOR = 23,
-       OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_VARIABLE = 59, OP_DECORATE = 71,
+       OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_CONSTANT = 43, OP_VARIABLE = 59, OP_DECORATE = 71,
        DEC_BUILTIN = 11, DEC_LOCATION = 30, DEC_COMPONENT = 31, SC_INPUT = 1, SC_OUTPUT = 3, EM_LOCAL_SIZE = 17 };
 
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (translated modules stay
@@ -963,11 +963,11 @@ static void reflect_spirv(GfxShader *s) {
     s->local[0] = s->local[1] = s->local[2] = 1;
     if (n < 5) return;
     uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
-    // per id: location + 1 (0 = none), component flag, scalar/vector description of types, pointee of pointers
+    // per id: location + 1 (0 = none), component flag, scalar/vector type and array span, pointer target, constant value
     int32_t *loc = calloc(bound, sizeof *loc);
-    uint8_t *packed = calloc(bound, 1), *ttype = calloc(bound, 1), *tcomps = calloc(bound, 1);
-    uint32_t *pointee = calloc(bound, sizeof *pointee);
-    if (!loc || !packed || !ttype || !tcomps || !pointee) goto out;
+    uint8_t *packed = calloc(bound, 1), *ttype = calloc(bound, 1), *tcomps = calloc(bound, 1), *tlocs = calloc(bound, 1);
+    uint32_t *pointee = calloc(bound, sizeof *pointee), *value = calloc(bound, sizeof *value);
+    if (!loc || !packed || !ttype || !tcomps || !tlocs || !pointee || !value) goto out;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) break;
@@ -979,13 +979,17 @@ static void reflect_spirv(GfxShader *s) {
             if (a[1] == DEC_LOCATION) loc[id] = (int32_t)a[2] + 1;
             else if (a[1] == DEC_COMPONENT) packed[id] = 1;
         } else if (op == OP_TYPE_INT && len >= 4 && id < bound) {
-            ttype[id] = a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT, tcomps[id] = 1;
+            ttype[id] = a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT, tcomps[id] = 1, tlocs[id] = 1;
         } else if (op == OP_TYPE_FLOAT && len >= 3 && id < bound) {
-            ttype[id] = GFX_TYPE_FLOAT, tcomps[id] = 1;
+            ttype[id] = GFX_TYPE_FLOAT, tcomps[id] = 1, tlocs[id] = 1;
         } else if (op == OP_TYPE_VECTOR && len >= 4 && id < bound && a[1] < bound) {
-            ttype[id] = ttype[a[1]], tcomps[id] = (uint8_t)a[2];
-        } else if (op == OP_TYPE_ARRAY && len >= 4 && id < bound && a[1] < bound) {
-            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]];   // element type (arrayed interface blocks)
+            ttype[id] = ttype[a[1]], tcomps[id] = (uint8_t)a[2], tlocs[id] = 1;
+        } else if (op == OP_CONSTANT && len == 4 && a[1] < bound) {
+            value[a[1]] = a[2];
+        } else if (op == OP_TYPE_ARRAY && len >= 4 && id < bound && a[1] < bound && a[2] < bound) {
+            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]];
+            uint64_t slots = (uint64_t)tlocs[a[1]] * value[a[2]];
+            tlocs[id] = (uint8_t)(slots < 32 ? slots : 32);   // the interface masks cover 32 locations
         } else if (op == OP_TYPE_POINTER && len >= 4 && id < bound) {
             pointee[id] = a[2];
         } else if (op == OP_VARIABLE && len >= 4) {
@@ -994,14 +998,20 @@ static void reflect_spirv(GfxShader *s) {
                 int l = loc[var] - 1;
                 uint32_t t = pointee[type] < bound ? pointee[type] : 0;
                 GfxShaderIo io = {ttype[t], tcomps[t] ? tcomps[t] : 4, packed[var]};
-                if (sc == SC_INPUT) s->in_mask |= 1u << l, s->in[l] = io;
-                else s->out_mask |= 1u << l, s->out[l] = io;
+                // VS -> FS arrays occupy every element's locations, even if only some elements are accessed.
+                // Other stages retain their existing reflection: mesh outputs have an outer per-vertex array.
+                uint32_t slots = ((s->stage == GFX_STAGE_VS && sc == SC_OUTPUT) ||
+                                  (s->stage == GFX_STAGE_FS && sc == SC_INPUT)) && tlocs[t] ? tlocs[t] : 1;
+                for (uint32_t j = 0; j < slots && l + j < 32; j++) {
+                    if (sc == SC_INPUT) s->in_mask |= 1u << (l + j), s->in[l + j] = io;
+                    else s->out_mask |= 1u << (l + j), s->out[l + j] = io;
+                }
             }
         }
         i += len;
     }
 out:
-    free(loc), free(packed), free(ttype), free(tcomps), free(pointee);
+    free(loc), free(packed), free(ttype), free(tcomps), free(tlocs), free(pointee), free(value);
 }
 
 // Every gradient sample (OpImageSampleExplicitLod with Grad) whose two gradients are each built from two components gets
@@ -1904,12 +1914,53 @@ typedef struct XWait {
 static struct {
     PlatMutex lock;
     PlatCond work, done;                         // done: a job finished (gfx_shader_await)
+    PlatCond lwork;                              // a disk read was queued (load_worker)
     XJob *head, *tail;
+    XJob *lhead, *ltail;                         // disk reads past the render thread's budget (load_budget)
     XWait *waits[256];
     int started;                                           // 1 running, -1 no thread could be created
-} X = {PLAT_MUTEX_INIT, PLAT_COND_INIT, PLAT_COND_INIT};
+    int loaders;                                           // load_worker threads running
+} X = {PLAT_MUTEX_INIT, PLAT_COND_INIT, PLAT_COND_INIT, PLAT_COND_INIT};
 
 static volatile int64_t n_async;
+static volatile int64_t n_disk_sync, n_disk_sync_ns, n_disk_bg;   // gfx_shader_disk_counts
+
+// Disk reads in get_async_one, the render thread's lookup. A shader that is in the disk cache but not in memory yet is
+// read there while those reads stay within LOAD_SHARE of the wall time, at most LOAD_BURST_NS at once; past that a
+// load_worker reads it, and its draws are skipped (or a one-shot draw waits) as for a shader being translated. Reading a
+// pair of loose files the first time took 5.6 ms on Windows, against 0.08 ms once the system had them: the time is
+// spent opening the files, not reading them. An area that needed 50 shaders not met before held one frame for 100 to 500
+// ms. A packed pair takes a fraction of a millisecond, so with a pack nearly all of them are still read in place.
+#define LOAD_BURST_NS 2000000ll
+#define LOAD_SHARE 8                                       // a budget of 1/8 of the wall time
+#define LOADERS 3
+static PlatMutex load_lock = PLAT_MUTEX_INIT;
+static int64_t load_tokens = LOAD_BURST_NS;               // under load_lock
+static uint64_t load_last;
+
+// Whether the render thread may read from the disk cache now.
+static int load_budget(void) {
+    uint64_t now = plat_now_ns();
+    plat_mutex_lock(&load_lock);
+    if (load_last) load_tokens += (int64_t)(now - load_last) / LOAD_SHARE;
+    if (load_tokens > LOAD_BURST_NS) load_tokens = LOAD_BURST_NS;
+    load_last = now;
+    int ok = load_tokens > 0;
+    plat_mutex_unlock(&load_lock);
+    return ok;
+}
+
+static void load_spent(uint64_t ns) {
+    plat_mutex_lock(&load_lock);
+    load_tokens -= (int64_t)ns;
+    plat_mutex_unlock(&load_lock);
+    plat_inc64(&n_disk_sync);
+    __atomic_add_fetch(&n_disk_sync_ns, (int64_t)ns, __ATOMIC_RELAXED);
+}
+
+void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg) {
+    *sync = (uint64_t)n_disk_sync, *sync_ns = (uint64_t)n_disk_sync_ns, *bg = (uint64_t)n_disk_bg;
+}
 
 // Caller holds X.lock.
 static XWait **wait_slot(const uint8_t key[32]) {
@@ -1938,6 +1989,67 @@ static void xlate_worker(void *arg) {
     }
     return;
 }
+
+// Reads the shaders get_async_one queued past its budget (load_budget), in get_one's disk order: the current key, then
+// a previous translator's entry. One the disk cache lacks goes on to the translation queue, its key still waiting.
+static void load_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        plat_mutex_lock(&X.lock);
+        while (!X.lhead) plat_cond_wait(&X.lwork, &X.lock);
+        XJob *j = X.lhead;
+        if (!(X.lhead = j->next)) X.ltail = NULL;
+        plat_mutex_unlock(&X.lock);
+        GfxShader *d = j->r.final ? disk_load(j->r.key, j->r.iid) : NULL;
+        const GfxShader *s = d ? mem_insert(d) : carry_find(j->r.code_hash, &j->a, j->stage, 1);
+        plat_mutex_lock(&X.lock);
+        if (s) {
+            XWait **w = wait_slot(j->r.key), *e = *w;
+            if (e) *w = e->next, free(e);
+        } else {
+            j->next = NULL;
+            if (X.tail) X.tail->next = j;
+            else X.head = j;
+            X.tail = j;
+            plat_cond_signal(&X.work);
+        }
+        plat_mutex_unlock(&X.lock);
+        if (!s) continue;
+        plat_cond_broadcast(&X.done);
+        plat_inc64(&n_hits), plat_inc64(&n_disk_bg);
+        free(j->control), free(j->code), free(j);
+    }
+}
+
+// Caller holds X.lock: the translation workers and the disk readers, started at the first job.
+static void start_workers(void) {
+    if (!X.started) {
+        int n = 0;
+        for (int i = 0; i < svc_runtime_limit(); i++) {
+            if (plat_thread_spawn(xlate_worker, NULL, "xlate", 0)) n++;
+        }
+        X.started = n ? 1 : -1;
+        if (n) rt_log("gfx_shader: graphics shaders are translated by %d background workers (NX2NAVI_XLATE_PROCS)", n);
+        else rt_log("gfx_shader: cannot start the translation workers; translating synchronously");
+        for (int i = 0; n && i < LOADERS; i++) {
+            if (plat_thread_spawn(load_worker, NULL, "shload", 0)) __atomic_add_fetch(&X.loaders, 1, __ATOMIC_RELAXED);
+        }
+    }
+}
+
+// Caller holds X.lock: the job of key to the front of its queue, so the worker takes it next (gfx_shader_await).
+static void to_front(XJob **head, XJob **tail, const uint8_t key[32]) {
+    for (XJob *j = *head, *prev = NULL; j; prev = j, j = j->next)
+        if (!memcmp(j->r.key, key, 32)) {
+            if (prev) {
+                prev->next = j->next;
+                if (*tail == j) *tail = prev;
+                j->next = *head, *head = j;
+            }
+            return;
+        }
+}
+
 const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                       const GfxShaderAnswers *a, int *pending) {
     *pending = 0;
@@ -1961,41 +2073,45 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     if (w) return *pending = !failed, NULL;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
-    if (r.final && (s = disk_load(r.key, r.iid))) return plat_inc64(&n_hits), mem_insert(s);
-    if ((s = carry_find(r.code_hash, a, stage, 1))) return plat_inc64(&n_hits), s;
+    int read = load_budget() || __atomic_load_n(&X.loaders, __ATOMIC_RELAXED) == 0;   // the disk here, or a loader
+    if (read) {
+        uint64_t t0 = plat_now_ns();
+        GfxShader *d = r.final ? disk_load(r.key, r.iid) : NULL;
+        s = d ? mem_insert(d) : carry_find(r.code_hash, a, stage, 1);
+        load_spent(plat_now_ns() - t0);
+        if (s) return plat_inc64(&n_hits), s;
+    }
 
     XJob *j = calloc(1, sizeof *j);
     XWait *e = calloc(1, sizeof *e);
     uint8_t *ctl = malloc(CONTROL_SIZE), *cd = malloc(r.length);
     plat_mutex_lock(&X.lock);
-    if (!X.started) {
-        int n = 0;
-        for (int i = 0; i < svc_runtime_limit(); i++) {
-            if (plat_thread_spawn(xlate_worker, NULL, "xlate", 0)) n++;
-        }
-        X.started = n ? 1 : -1;
-        if (n) rt_log("gfx_shader: graphics shaders are translated by %d background workers (NX2NAVI_XLATE_PROCS)", n);
-        else rt_log("gfx_shader: cannot start the translation workers; translating synchronously");
-    }
+    start_workers();
     XWait **slot = wait_slot(r.key);
     int raced = *slot != NULL;                             // another thread queued it between the checks
     int queued = !raced && X.started == 1 && j && e && ctl && cd;
+    int load = queued && !read && X.loaders;               // past the budget: a loader reads it first
     if (queued) {
         memcpy(ctl, control, CONTROL_SIZE), memcpy(cd, code, r.length);
         *j = (XJob){.stage = stage, .r = r, .control = ctl, .code = cd, .a = *a};
         j->r.c1 = cd + (r.length - r.c1_len);
         memcpy(e->key, r.key, 32);
         *slot = e;
-        if (X.tail) X.tail->next = j;
-        else X.head = j;
-        X.tail = j;
-        plat_cond_signal(&X.work);
+        XJob **head = load ? &X.lhead : &X.head, **tail = load ? &X.ltail : &X.tail;
+        if (*tail) (*tail)->next = j;
+        else *head = j;
+        *tail = j;
+        plat_cond_signal(load ? &X.lwork : &X.work);
     }
     plat_mutex_unlock(&X.lock);
     if (queued) return *pending = 1, NULL;
     free(j), free(e), free(ctl), free(cd);
     if (raced) return *pending = 1, NULL;
-    return translate(&r, stage, control, code, a);         // no worker or out of memory
+    if (!read) {                                           // no worker or out of memory: everything here
+        GfxShader *d = r.final ? disk_load(r.key, r.iid) : NULL;
+        if ((s = d ? mem_insert(d) : carry_find(r.code_hash, a, stage, 1))) return plat_inc64(&n_hits), s;
+    }
+    return translate(&r, stage, control, code, a);
 }
 
 const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
@@ -2008,15 +2124,8 @@ const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8
     if (!pending || !req_init(&r, stage, control, code, code_size, NULL, a)) return s;
     uint64_t p0 = perf_begin();   // the wait counts as the render thread's translation time
     plat_mutex_lock(&X.lock);
-    for (XJob *j = X.head, *prev = NULL; j; prev = j, j = j->next)
-        if (!memcmp(j->r.key, r.key, 32)) {                // queued: to the front, the worker takes it next
-            if (prev) {
-                prev->next = j->next;
-                if (X.tail == j) X.tail = prev;
-                j->next = X.head, X.head = j;
-            }
-            break;
-        }
+    to_front(&X.lhead, &X.ltail, r.key);                   // queued: to the front, a worker takes it next
+    to_front(&X.head, &X.tail, r.key);
     XWait *w;
     while ((w = *wait_slot(r.key)) && !w->failed) plat_cond_wait(&X.done, &X.lock);
     plat_mutex_unlock(&X.lock);
