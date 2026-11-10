@@ -13,6 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 from translation import fonts, msbt, po, sarc, textures  # noqa: E402
+from translation import project  # noqa: E402
 
 
 def make_sarc(members, align=0x10):
@@ -241,14 +242,53 @@ class Desk(unittest.TestCase):
             desk = server.Desk.__new__(server.Desk)
             desk.p, desk.voices, desk._parsed = SimpleNamespace(text=Path(tmp) / 'text'), {}, {}
             desk.lock = __import__('threading').Lock()
-            r = desk.save('G/F', 'a', 'ชื่อ', True, 'check the name')
+            r = desk.save('G/F', 'a', 'ชื่อ', 'fuzzy', 'check the name')
             self.assertEqual([c['level'] for c in r['entry']['checks']], ['error'])     # the colour codes are gone
-            self.assertEqual((r['done'], r['fuzzy'], r['total']), (1, 1, 2))
+            self.assertEqual((r['done'], r['fuzzy'], r['draft'], r['total']), (1, 1, 0, 2))
             _, back = po.loads((text / 'F.po').read_text(encoding='utf-8'))
             self.assertEqual((back[0].msgstr, back[0].fuzzy, back[0].notes), ('ชื่อ', True, ['check the name']))
             self.assertEqual(back[1].msgstr, 'อื่น')
             with self.assertRaises(KeyError):
-                desk.save('../outside', 'a', 'x', False, None)
+                desk.save('../outside', 'a', 'x', 'done', None)
+
+
+class Check(unittest.TestCase):
+    def test_lines_are_measured_per_box(self):
+        ref = ['ref: Twelve chars{0.4}Twelve chars']
+        fits = po.Entry(ctx='a', msgid='一{0.4}二', msgstr='ขนาดสิบสองตัว{0.4}ขนาดสิบสองตัว', comments=ref)
+        self.assertEqual(project.check_entry(fits), [])     # two boxes, not one 24-character line
+        long = po.Entry(ctx='b', msgid='一{0.4}二', msgstr='ยาวกว่าสิบสองตัวไปมากเลยนะ{0.4}สั้น', comments=ref)
+        self.assertEqual([lvl for lvl, _ in project.check_entry(long)], ['warning'])
+
+    def test_box_that_starts_with_a_line_break(self):
+        e = po.Entry(ctx='a', msgid='一{0.4}二', msgstr='หนึ่ง{0.4}\nสอง')
+        self.assertIn('page break', project.check_entry(e)[0][1])
+        self.assertEqual(project.check_entry(po.Entry(ctx='b', msgid='一{0.4}二', msgstr='หนึ่ง{0.4}สอง')), [])
+
+
+class Drafts(unittest.TestCase):
+    def test_put_writes_drafts_and_keeps_reviewed_ones(self):
+        import tempfile
+        from types import SimpleNamespace
+        from translation import drafts
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'text' / 'G').mkdir(parents=True)
+            (root / 'glossary.tsv').write_text('source\treference\ttranslation\twhere\nリンク\tLink\tลิงก์\tx\n',
+                                               encoding='utf-8')
+            entries = [po.Entry(ctx='a', msgid='{4.0:\'Think\'}リンク！'), po.Entry(ctx='b', msgid='別', msgstr='อื่น'),
+                       po.Entry(ctx='c', msgid='{4.0:\'Think\'}はい')]
+            (root / 'text' / 'G' / 'F.po').write_text(po.dumps([('Language', 'th')], entries), encoding='utf-8')
+            p = SimpleNamespace(root=root, text=root / 'text')
+            shown = drafts.show(p, 'G/F', todo=True)
+            self.assertEqual([r['ctx'] for r in shown], ['a', 'c'])
+            self.assertEqual(shown[0]['names'], [{'ja': 'リンク', 'en': 'Link', 'th': 'ลิงก์'}])
+            r = drafts.put(p, 'G/F', [{'ctx': 'a', 'th': "{4.0:'Think'}ลิงก์!"}, {'ctx': 'b', 'th': 'ทับ'},
+                                      {'ctx': 'c', 'th': 'ครับ'}])
+            self.assertEqual((r['written'], r['kept'], [c for c, _ in r['refused']]), (1, 1, ['c']))
+            _, back = po.loads((root / 'text' / 'G' / 'F.po').read_text(encoding='utf-8'))
+            self.assertEqual([(e.msgstr, project.state(e)) for e in back],
+                             [("{4.0:'Think'}ลิงก์!", 'draft'), ('อื่น', 'done'), ('', '')])
 
 
 def box_font(glyphs, cmap, upm, cff):

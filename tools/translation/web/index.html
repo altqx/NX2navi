@@ -23,6 +23,7 @@
       <button type="button" data-filter="all" class="on" role="radio" aria-checked="true">All</button>
       <button type="button" data-filter="todo" role="radio" aria-checked="false">To translate</button>
       <button type="button" data-filter="voiced" role="radio" aria-checked="false">Voiced</button>
+      <button type="button" data-filter="draft" role="radio" aria-checked="false">With drafts</button>
     </div>
     <nav id="file-list" class="file-list"></nav>
   </aside>
@@ -34,6 +35,7 @@
       <div class="filters small" role="radiogroup" aria-label="Show messages">
         <button type="button" data-show="all" class="on" role="radio" aria-checked="true">All</button>
         <button type="button" data-show="todo" role="radio" aria-checked="false">To translate</button>
+        <button type="button" data-show="draft" role="radio" aria-checked="false">Drafts</button>
         <button type="button" data-show="fuzzy" role="radio" aria-checked="false">Needs review</button>
       </div>
     </header>
@@ -104,12 +106,19 @@
   </section>
 
   <footer class="actions">
-    <label class="toggle"><input type="checkbox" data-f="fuzzy"> Needs review</label>
+    <div class="status" role="radiogroup" aria-label="Status of the translation" data-f="status">
+      <label class="s-draft" title="A machine draft no one has reviewed (Alt+D)"><input type="radio" name="status" value="draft"> Draft</label>
+      <label class="s-fuzzy" title="Translated, to look at again (Alt+R)"><input type="radio" name="status" value="fuzzy"> Needs review</label>
+      <label class="s-done" title="Reviewed and final"><input type="radio" name="status" value="done"> Done</label>
+    </div>
     <details class="note">
       <summary>Note</summary>
       <textarea data-f="note" rows="2" placeholder="A note for yourself, kept in the PO file"></textarea>
     </details>
     <span class="state" data-f="state"></span>
+    <button type="button" data-act="approve" title="Mark it done, save and go to the next message to translate (Alt+A)" hidden>
+      Approve and next
+    </button>
     <button type="button" class="primary" data-act="save" title="Save and go to the next message to translate (Ctrl+Enter)">
       Save and next
     </button>
@@ -119,7 +128,8 @@
 <template id="keys-template">
   <p class="keys"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> save and next · <kbd>Ctrl</kbd>+<kbd>S</kbd> save ·
     <kbd>Alt</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> move · <kbd>Alt</kbd>+<kbd>J</kbd> Japanese voice ·
-    <kbd>Alt</kbd>+<kbd>E</kbd> English voice · <kbd>Alt</kbd>+<kbd>R</kbd> needs review</p>
+    <kbd>Alt</kbd>+<kbd>E</kbd> English voice · <kbd>Alt</kbd>+<kbd>A</kbd> approve and next ·
+    <kbd>Alt</kbd>+<kbd>D</kbd> draft · <kbd>Alt</kbd>+<kbd>R</kbd> needs review</p>
 </template>
 
 <script src="desk.js"></script>

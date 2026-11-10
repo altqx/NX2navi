@@ -11,13 +11,15 @@ The API (JSON unless noted):
     GET  /api/project                  the project and every PO file with its counts
     GET  /api/file?path=G/F            a PO file's entries (path: text/G/F.po without .po)
     POST /api/check  {path, ctx, msgstr}               the checks of a draft, nothing saved
-    POST /api/save   {path, ctx, msgstr, fuzzy, note}  saves one entry; returns its checks and the file's counts
+    POST /api/save   {path, ctx, msgstr, status, note} saves one entry (status: done, fuzzy = needs review, or
+                                                       draft = a machine draft); returns its checks and the counts
     GET  /api/voice?path=G/F&ctx=L&lang=JPja           the voice (audio/ogg or audio/wav)
     GET  /api/search?q=TEXT                            entries whose source, reference or translation has TEXT
     GET  /api/glossary                 glossary.tsv rows
     POST /api/glossary {source, translation}           sets a name's translation
     GET  /font/<file>                  a font file of the project's fonts/ folder (for the Thai preview)
 """
+import collections
 import json
 import mimetypes
 import os
@@ -32,6 +34,7 @@ from . import project as pj
 
 WEB = Path(__file__).resolve().parent / 'web'
 AUDIO_CACHE = 64
+STATUSES = ('done', 'fuzzy', 'draft')
 
 
 class Desk:
@@ -66,9 +69,9 @@ class Desk:
 
     def counts(self, rel, entries):
         voiced = sum(1 for e in entries if self.voices.get((rel, e.ctx)))
-        done = sum(1 for e in entries if e.msgstr and not e.fuzzy)
-        fuzzy = sum(1 for e in entries if e.msgstr and e.fuzzy)
-        return {'total': len(entries), 'done': done, 'fuzzy': fuzzy, 'voiced': voiced}
+        states = collections.Counter(pj.state(e) for e in entries)
+        return {'total': len(entries), 'done': states['done'], 'fuzzy': states['fuzzy'], 'draft': states['draft'],
+                'voiced': voiced}
 
     def project(self):
         files = []
@@ -86,7 +89,7 @@ class Desk:
 
     def entry(self, rel, e):
         voices = sorted(self.voices.get((rel, e.ctx), {}))
-        return {'ctx': e.ctx, 'msgid': e.msgid, 'msgstr': e.msgstr, 'fuzzy': e.fuzzy, 'notes': '\n'.join(e.notes),
+        return {'ctx': e.ctx, 'msgid': e.msgid, 'msgstr': e.msgstr, 'state': pj.state(e), 'notes': '\n'.join(e.notes),
                 'plain': plain_text(e), 'ref': pj.reference_text(e), 'previous': e.previous, 'voices': voices,
                 'codes': msbt.codes(e.msgid), 'checks': checks(e) if e.msgstr else []}
 
@@ -94,7 +97,7 @@ class Desk:
         _, entries = self.read(self.po_path(rel))
         return {'path': rel, 'entries': [self.entry(rel, e) for e in entries], **self.counts(rel, entries)}
 
-    def save(self, rel, ctx, msgstr, fuzzy, note):
+    def save(self, rel, ctx, msgstr, status, note):
         path = self.po_path(rel)
         with self.lock:
             header, entries = po.loads(path.read_text(encoding='utf-8'), str(path))
@@ -102,7 +105,10 @@ class Desk:
             if e is None:
                 raise KeyError(f'{rel} has no message {ctx}')
             e.msgstr = msgstr.replace('\r\n', '\n')
-            e.set_fuzzy(bool(fuzzy) and bool(e.msgstr))
+            if status not in STATUSES:
+                raise ValueError(f'status is one of {", ".join(STATUSES)}, not {status}')
+            e.set_fuzzy(status == 'fuzzy' and bool(e.msgstr))
+            e.set_draft(status == 'draft' and bool(e.msgstr))
             if not e.fuzzy:
                 e.previous = None
             if note is not None:
@@ -260,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
             if url.path == '/api/save':
-                return self.send(200, d.save(body['path'], body['ctx'], body.get('msgstr', ''), body.get('fuzzy'),
+                return self.send(200, d.save(body['path'], body['ctx'], body.get('msgstr', ''), body.get('status', 'done'),
                                              body.get('note')))
             if url.path == '/api/check':
                 return self.send(200, d.draft_checks(body['path'], body['ctx'], body.get('msgstr', '')))

@@ -1,5 +1,5 @@
 /* The translator's desk. Dark panels for long sessions; gold marks only what is live now (the current message,
-   a voice playing); green, amber and red only carry status. The dialogue-box preview is the one piece of show. */
+   a voice playing); green (done), blue (machine draft), amber and red only carry status. The dialogue-box preview is the one piece of show. */
 :root {
   --ink: #121a22;
   --panel: #17212b;
@@ -10,6 +10,7 @@
   --gold: #e2b14d;
   --done: #62b48c;
   --review: #e38a4b;
+  --draft: #7b9ad8;
   --error: #e56868;
   --box: rgba(5, 9, 16, .9);
   --ui: "IBM Plex Sans Thai Looped", "IBM Plex Sans", system-ui, sans-serif;
@@ -37,9 +38,10 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .files-head h1 { font-size: 17px; letter-spacing: .01em; }
 .files-head p { margin: 2px 0 10px; font-size: 13px; }
 .progress { position: relative; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; margin-bottom: 6px; }
-.progress i, .progress b { position: absolute; inset: 0 auto 0 0; display: block; }
+.progress i, .progress b, .progress u { position: absolute; inset: 0 auto 0 0; display: block; }
 .progress i { background: var(--done); }
 .progress b { background: var(--review); }
+.progress u { background: var(--draft); }
 .search { display: block; padding: 0 14px 10px; }
 .search input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--ink); }
 .filters { display: flex; gap: 4px; padding: 0 14px 10px; flex-wrap: wrap; }
@@ -74,12 +76,14 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .message-list .mark { border-radius: 0 2px 2px 0; background: transparent; grid-row: span 2; }
 .message-list .done .mark { background: var(--done); }
 .message-list .fuzzy .mark { background: var(--review); }
+.message-list .draft .mark { background: var(--draft); }
 .message-list .current { background: var(--raise); }
 .message-list .current .mark { background: var(--gold); }
 .message-list .label { font: 11px var(--mono); color: var(--muted); display: flex; gap: 6px; }
 .message-list .line { font: 14px/1.45 var(--ja); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .message-list .line.th { font-family: var(--thai); color: var(--done); }
 .message-list .fuzzy .line.th { color: var(--review); }
+.message-list .draft .line.th { color: var(--draft); }
 .message-list .hit { font-size: 12px; color: var(--muted); }
 
 /* ---- editor */
@@ -156,7 +160,15 @@ textarea[data-f="msgstr"]:focus { border-color: var(--gold); outline: none; }
   margin: 8px -28px -28px; padding: 12px 28px 16px; background: linear-gradient(transparent, var(--ink) 30%); }
 .actions .note { flex: 1; min-width: 160px; font-size: 13px; color: var(--muted); }
 .actions .note textarea { width: 100%; margin-top: 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--ink); padding: 6px 8px; }
-.actions .toggle { margin-left: 0; font-size: 13px; color: var(--text); }
+.status { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; font-size: 13px; }
+.status label { display: inline-flex; align-items: center; padding: 5px 10px; color: var(--muted); cursor: pointer; }
+.status label + label { border-left: 1px solid var(--line); }
+.status input { position: absolute; opacity: 0; pointer-events: none; }
+.status label:has(input:focus-visible) { outline: 2px solid var(--gold); outline-offset: -2px; }
+.status .s-draft:has(:checked) { background: color-mix(in srgb, var(--draft) 22%, transparent); color: var(--draft); }
+.status .s-fuzzy:has(:checked) { background: color-mix(in srgb, var(--review) 22%, transparent); color: var(--review); }
+.status .s-done:has(:checked) { background: color-mix(in srgb, var(--done) 22%, transparent); color: var(--done); }
+.status.blank { opacity: .4; pointer-events: none; }
 .state { font: 12px var(--mono); color: var(--muted); }
 .state.saved { color: var(--done); }
 .state.failed { color: var(--error); }
@@ -178,3 +190,4 @@ kbd { font: 11px var(--mono); padding: 0 4px; border: 1px solid var(--line); bor
   .voice .voice-bar i { transition: width .1s linear; }
   .file, .message-list li button { transition: background-color .12s; }
 }
+.actions [data-act="approve"] { border-color: var(--done); color: var(--done); padding: 7px 14px; }

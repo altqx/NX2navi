@@ -126,15 +126,28 @@ function groupsOf(files) {
 function fileVisible(f) {
   if (S.fileFilter === 'todo') return f.done < f.total;
   if (S.fileFilter === 'voiced') return f.voiced > 0;
+  if (S.fileFilter === 'draft') return f.draft > 0;
   return true;
 }
 
-function progressBar(done, fuzzy, total) {
-  const p = el('div', { className: 'progress' }, el('i'), el('b'));
-  p.firstChild.style.width = `${total ? (100 * done) / total : 0}%`;
-  p.lastChild.style.left = p.firstChild.style.width;
-  p.lastChild.style.width = `${total ? (100 * fuzzy) / total : 0}%`;
+// done, then needs review, then drafts, side by side
+function progressBar(f) {
+  const p = el('div', { className: 'progress' });
+  let at = 0;
+  for (const [tag, n] of [['i', f.done], ['b', f.fuzzy], ['u', f.draft || 0]]) {
+    const w = f.total ? (100 * n) / f.total : 0;
+    const seg = el(tag);
+    Object.assign(seg.style, { left: `${at}%`, width: `${w}%` });
+    p.append(seg);
+    at += w;
+  }
   return p;
+}
+
+function sum(files, key) { return files.reduce((a, f) => a + (f[key] || 0), 0); }
+
+function countText(f) {
+  return `${f.done} of ${f.total} done` + (f.draft ? `, ${f.draft} drafts` : '') + (f.fuzzy ? `, ${f.fuzzy} to review` : '');
 }
 
 function renderFiles() {
@@ -152,7 +165,7 @@ function renderFiles() {
         el('span', { className: 'name', textContent: f.name }),
         el('span', { className: 'meta' }, f.voiced ? el('span', { className: 'speaker', textContent: '♪ ', title: `${f.voiced} voiced` }) : null,
           `${f.done}/${f.total}`),
-        progressBar(f.done, f.fuzzy, f.total));
+        progressBar(f));
       if (S.file && S.file.path === f.path) b.classList.add('current');
       if (f.total && f.done === f.total) b.classList.add('complete');
       b.addEventListener('click', () => openFile(f.path));
@@ -167,10 +180,9 @@ function renderFiles() {
     });
     list.append(sec);
   }
-  const done = S.files.reduce((a, f) => a + f.done, 0), fuzzy = S.files.reduce((a, f) => a + f.fuzzy, 0);
-  const total = S.files.reduce((a, f) => a + f.total, 0);
-  $('#total-progress').replaceWith(Object.assign(progressBar(done, fuzzy, total), { id: 'total-progress' }));
-  $('#total-count').textContent = `${done} of ${total} messages translated` + (fuzzy ? `, ${fuzzy} to review` : '');
+  const all = Object.fromEntries(['done', 'fuzzy', 'draft', 'total'].map((k) => [k, sum(S.files, k)]));
+  $('#total-progress').replaceWith(Object.assign(progressBar(all), { id: 'total-progress' }));
+  $('#total-count').textContent = countText(all).replace(' done', ' messages done');
 }
 
 // ---- messages
@@ -182,7 +194,7 @@ function shortLabel(ctx) {
 
 function entryVisible(e) {
   if (S.show === 'todo') return !e.msgstr;
-  if (S.show === 'fuzzy') return e.msgstr && e.fuzzy;
+  if (S.show === 'fuzzy' || S.show === 'draft') return e.state === S.show;
   return true;
 }
 
@@ -193,11 +205,10 @@ function renderMessages() {
   const f = S.file;
   if (!f) return;
   $('#file-name').textContent = f.path;
-  $('#file-count').textContent = `${f.done} of ${f.total} translated` + (f.fuzzy ? `, ${f.fuzzy} to review` : '')
-    + (f.voiced ? ` · ${f.voiced} voiced` : '');
+  $('#file-count').textContent = countText(f) + (f.voiced ? ` · ${f.voiced} voiced` : '');
   f.entries.forEach((e, i) => {
     if (!entryVisible(e) && i !== S.index) return;
-    const state = e.msgstr ? (e.fuzzy ? 'fuzzy' : 'done') : '';
+    const state = e.state;
     const b = el('button', { type: 'button' },
       el('span', { className: 'mark' }),
       el('span', { className: 'label' }, shortLabel(e.ctx), e.voices.length ? el('span', { className: 'speaker', textContent: '♪' }) : null),
@@ -242,13 +253,22 @@ function select(i, skipLeave) {
     stopVoice();
     S.index = i;
     const e = S.file.entries[i];
-    S.saved = { msgstr: e.msgstr, fuzzy: e.fuzzy, notes: e.notes };
+    S.saved = savedOf(e);
     history.replaceState(null, '', `#${encodeURIComponent(S.file.path)}::${encodeURIComponent(e.ctx)}`);
     localStorage.deskLast = JSON.stringify([S.file.path, e.ctx]);
     renderEditor(e);
     renderMessages();
   };
   return go();
+}
+
+function savedOf(e) { return { msgstr: e.msgstr, status: e.state || 'done', notes: e.notes }; }
+
+function status() { return $('[data-f="status"] input:checked', $('#editor'))?.value || 'done'; }
+
+function setStatus(value) {
+  const r = $(`[data-f="status"] input[value="${value}"]`, $('#editor'));
+  if (r) { r.checked = true; update(); }
 }
 
 function renderEditor(e) {
@@ -284,11 +304,12 @@ function renderEditor(e) {
 
   const ta = field('msgstr');
   ta.value = e.msgstr;
-  field('fuzzy').checked = e.fuzzy;
+  $(`[data-f="status"] input[value="${e.state || 'done'}"]`, ed).checked = true;
   field('note').value = e.notes;
   if (e.notes) $('.note', ed).open = true;
   ta.addEventListener('input', () => { update(); queueCheck(); });
-  field('fuzzy').addEventListener('change', update);
+  field('status').addEventListener('change', update);
+  $('[data-act="approve"]', ed).addEventListener('click', approve);
   field('note').addEventListener('input', update);
   $('[data-act="save"]', ed).addEventListener('click', () => save(true));
   $('[data-act="prev"]', ed).addEventListener('click', () => move(-1));
@@ -338,13 +359,15 @@ function update() {
     b.className = m === n ? 'used' : m > n ? 'over' : '';
     b.title = `Insert ${b.dataset.code} (the source has ${n}, the Thai ${m})`;
   }
+  $('[data-act="approve"]').hidden = !text || status() === 'done' && S.saved.status === 'done';
+  field('status').classList.toggle('blank', !text);
   const state = field('state');
   if (dirty()) { state.textContent = 'Not saved'; state.className = 'state'; }
 }
 
 function dirty() {
   if (!S.file || S.index < 0 || !field('msgstr')) return false;
-  return field('msgstr').value !== S.saved.msgstr || field('fuzzy').checked !== S.saved.fuzzy
+  return field('msgstr').value !== S.saved.msgstr || (field('msgstr').value && status() !== S.saved.status)
     || field('note').value.trim() !== S.saved.notes.trim();
 }
 
@@ -376,17 +399,17 @@ async function save(next) {
   if (!S.file || S.index < 0) return true;
   const e = S.file.entries[S.index];
   const state = field('state');
-  const body = { path: S.file.path, ctx: e.ctx, msgstr: field('msgstr').value, fuzzy: field('fuzzy').checked,
+  const body = { path: S.file.path, ctx: e.ctx, msgstr: field('msgstr').value, status: status(),
     note: field('note').value };
   if (dirty()) {
     state.textContent = 'Saving…';
     try {
       const r = await api('/api/save', body);
       Object.assign(e, r.entry);
-      Object.assign(S.file, { done: r.done, fuzzy: r.fuzzy, total: r.total, voiced: r.voiced });
-      const f = S.files.find((x) => x.path === S.file.path);
-      Object.assign(f, { done: r.done, fuzzy: r.fuzzy, total: r.total });
-      S.saved = { msgstr: e.msgstr, fuzzy: e.fuzzy, notes: e.notes };
+      const counts = { done: r.done, fuzzy: r.fuzzy, draft: r.draft, total: r.total };
+      Object.assign(S.file, counts, { voiced: r.voiced });
+      Object.assign(S.files.find((x) => x.path === S.file.path), counts);
+      S.saved = savedOf(e);
       state.textContent = `Saved ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
       state.className = 'state saved';
       showChecks(r.entry.checks, e.msgstr);
@@ -399,11 +422,17 @@ async function save(next) {
     }
   }
   if (next) {
-    const n = S.file.entries.findIndex((x, j) => j > S.index && (!x.msgstr || x.fuzzy));
+    const n = S.file.entries.findIndex((x, j) => j > S.index && (!x.msgstr || x.state !== 'done'));
     if (n >= 0) await select(n, true);
     else if (S.index + 1 < S.file.entries.length) await select(S.index + 1, true);
   }
   return true;
+}
+
+function approve() {
+  if (!field('msgstr').value) return;
+  setStatus('done');
+  save(true);
 }
 
 // Leaving a message saves it when it changed; false when the save failed (the page stays).
@@ -519,11 +548,11 @@ document.addEventListener('keydown', (ev) => {
   else if (ev.altKey && ev.key === 'ArrowDown') { ev.preventDefault(); move(1); }
   else if (ev.altKey && ev.key.toLowerCase() === 'j') { ev.preventDefault(); toggleVoice($('[data-voice="slot"]', ed)); }
   else if (ev.altKey && ev.key.toLowerCase() === 'e') { ev.preventDefault(); toggleVoice($('[data-voice="reference"]', ed)); }
+  else if (ev.altKey && ev.key.toLowerCase() === 'a') { ev.preventDefault(); approve(); }
+  else if (ev.altKey && ev.key.toLowerCase() === 'd') { ev.preventDefault(); setStatus('draft'); }
   else if (ev.altKey && ev.key.toLowerCase() === 'r') {
     ev.preventDefault();
-    const f = field('fuzzy');
-    f.checked = !f.checked;
-    update();
+    setStatus(status() === 'fuzzy' ? (S.saved.status === 'fuzzy' ? 'done' : S.saved.status) : 'fuzzy');
   }
 });
 

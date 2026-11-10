@@ -9,6 +9,9 @@
     python tools/translate.py build     [--project P]   the mod, into <install folder>/mods/<mod>
     python tools/translate.py serve     [--project P] [--port N]   the translator's desk, a local web page: each
                                                                message with its reference and voices, saved to PO
+    python tools/translate.py draft show --file G/F [--from N] [--count N] [--todo]   messages as JSON lines
+    python tools/translate.py draft put --file G/F < drafts.jsonl   writes {"ctx", "th", "note"} lines as drafts (flag
+                                                               "draft"), never over a reviewed translation
     python tools/translate.py selftest  [--game <install folder>]   every text archive, font and lettered texture
                                                                read and written back unchanged
 
@@ -71,11 +74,11 @@ def cmd_extract(a):
 def cmd_status(a):
     p = pj.Project(a.project)
     rows = p.status()
-    total = [sum(r[i] for r in rows) for i in (1, 2, 3)]
-    print(f'{"group":24} {"messages":>9} {"done":>9} {"fuzzy":>7}')
-    for g, n, done, fuzzy in rows + [('total', *total)]:
+    total = [sum(r[i] for r in rows) for i in (1, 2, 3, 4)]
+    print(f'{"group":24} {"messages":>9} {"done":>9} {"fuzzy":>7} {"draft":>7}')
+    for g, n, done, fuzzy, draft in rows + [('total', *total)]:
         pct = f'{100 * done / n:5.1f}%' if n else ''
-        print(f'{g:24} {n:9} {done:9} {fuzzy:7}  {pct}')
+        print(f'{g:24} {n:9} {done:9} {fuzzy:7} {draft:7}  {pct}')
 
 
 def cmd_check(a):
@@ -105,6 +108,23 @@ def cmd_textures(a):
 def cmd_serve(a):
     from translation import server
     server.serve(pj.Project(a.project), a.port)
+
+
+def cmd_draft(a):
+    import json
+    from translation import drafts
+    p = pj.Project(a.project)
+    if a.action == 'show':
+        for row in drafts.show(p, a.file, a.start, a.count, a.todo):
+            print(json.dumps(row, ensure_ascii=False))
+        return 0
+    r = drafts.put(p, a.file, drafts.read_rows(sys.stdin))
+    for ctx, why in r['refused']:
+        print(f'refused: {ctx}: {why}')
+    for ctx, text in r['warnings']:
+        print(f'warning: {ctx}: {text}')
+    print(f'{r["written"]} drafts written, {len(r["refused"])} refused, {r["kept"]} reviewed translations kept')
+    return 1 if r['refused'] else 0
 
 
 def cmd_build(a):
@@ -183,6 +203,13 @@ def main():
             s.add_argument('--port', type=int, default=8765, help='the local port (default 8765)')
         if name == 'textures':
             s.add_argument('--match', help='a regular expression over RomFS paths: export those textures instead')
+    s = sub.add_parser('draft', help='machine drafts: read messages as JSON lines, write drafts back')
+    s.add_argument('action', choices=('show', 'put'))
+    s.add_argument('--file', required=True, help='a PO file under text/, without .po (G/F)')
+    s.add_argument('--project', default='.', help='the project folder (default: the current folder)')
+    s.add_argument('--from', dest='start', type=int, default=0, help='show: from this message index')
+    s.add_argument('--count', type=int, help='show: at most this many messages')
+    s.add_argument('--todo', action='store_true', help='show: only messages without a reviewed translation')
     s = sub.add_parser('selftest')
     s.add_argument('--game', required=True)
     a = ap.parse_args()

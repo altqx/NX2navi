@@ -48,6 +48,8 @@ language = "{language}"
 [build]
 # Use translations marked fuzzy (their source changed since they were written).
 fuzzy = false
+# Use machine drafts no one has reviewed yet (flag "draft"; tools/translate.py draft writes them).
+drafts = true
 # Write the mod even when a message's control codes do not match its source (check lists them).
 force = false
 # Draw each Thai letter with its marks as one glyph shaped by the Thai font (the game's text engine does not place
@@ -211,17 +213,15 @@ class Project:
         return po.loads(path.read_text(encoding='utf-8'), str(path))[1]
 
     def status(self):
-        """[(group, entries, translated, fuzzy)] and the totals."""
-        rows = collections.defaultdict(lambda: [0, 0, 0])
+        """[(group, entries, translated, fuzzy, draft)]: translated counts reviewed translations only."""
+        rows = collections.defaultdict(lambda: [0, 0, 0, 0])
         for path in self.po_files():
             group = path.relative_to(self.text).parts[0]
             for e in self.load(path):
                 r = rows[group]
                 r[0] += 1
-                if e.msgstr and e.fuzzy:
-                    r[2] += 1
-                elif e.msgstr:
-                    r[1] += 1
+                if e.msgstr:
+                    r[{'fuzzy': 2, 'draft': 3, 'done': 1}[state(e)]] += 1
         return sorted((g, *v) for g, v in rows.items())
 
     def check(self):
@@ -268,6 +268,7 @@ class Project:
         archive_path = self.text_archive(self.slot)
         archive = self.game.read(archive_path)
         use_fuzzy = self.build_cfg.get('fuzzy', False)
+        use_drafts = self.build_cfg.get('drafts', True)
         chosen = {}
         for name, data in sarc.read(archive):
             path = self.po_path(name)
@@ -278,7 +279,8 @@ class Project:
             m = msbt.Msbt(data)
             for i in range(len(m.messages)):
                 e = entries.get(m.label(i))
-                if not e or not e.msgstr or (e.fuzzy and not use_fuzzy) or e.msgstr == e.msgid:
+                if (not e or not e.msgstr or (e.fuzzy and not use_fuzzy) or (e.draft and not use_drafts)
+                        or e.msgstr == e.msgid):
                     continue
                 if f'{rel} [{e.ctx}]' not in bad:
                     chosen[(name, i)] = e.msgstr
@@ -454,6 +456,24 @@ def _alpha(game, path):
     return textures.decode(tex, data)[..., 3]
 
 
+def state(e):
+    """'' (no translation), 'fuzzy' (its source changed since), 'draft' (a machine draft not reviewed yet) or
+    'done'."""
+    if not e.msgstr:
+        return ''
+    return 'fuzzy' if e.fuzzy else 'draft' if e.draft else 'done'
+
+
+PAGE_BREAK = re.compile(r'\{0\.4\}')
+BOX_STARTS_EMPTY = re.compile(r'\{0\.4\}(?:\{(?!0\.4\})[^{}]*\})*\n')
+
+
+def box_lines(markup):
+    """The text lines of a message as the boxes show them: split at line breaks and at MSBT page breaks (system tag
+    0.4, which starts a new box), control codes left out."""
+    return fonts._clean(PAGE_BREAK.sub('\n', markup)).split('\n')
+
+
 def check_entry(e):
     """[(level, text)] of one translated entry (Project.check)."""
     out = []
@@ -472,10 +492,12 @@ def check_entry(e):
         out.append(('warning', 'button icons ({U+....}) differ from the source'))
     if e.msgstr != e.msgid and CJK.search(fonts._clean(e.msgstr)):
         out.append(('warning', 'Japanese characters left in the translation'))
+    if BOX_STARTS_EMPTY.search(e.msgstr) and not BOX_STARTS_EMPTY.search(e.msgid):
+        out.append(('warning', 'a line break right after a page break ({0.4}): the new box starts with an empty line'))
     ref = reference_text(e)
     if ref:
-        limit = max(len(line) for line in fonts._clean(ref).split('\n'))
-        for line in fonts._clean(e.msgstr).split('\n'):
+        limit = max(len(line) for line in box_lines(ref))
+        for line in box_lines(e.msgstr):
             width = sum(1 for c in line if c not in THAI_MARKS)
             if width > max(limit * 1.15, limit + 4):
                 out.append(('warning', f'a line of {width} characters; the reference\'s longest is {limit}: '

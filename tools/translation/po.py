@@ -23,10 +23,21 @@ class Entry:
         return 'fuzzy' in self.flags
 
     def set_fuzzy(self, on):
-        if on and not self.fuzzy:
-            self.flags.append('fuzzy')
-        elif not on and self.fuzzy:
-            self.flags.remove('fuzzy')
+        self._flag('fuzzy', on)
+
+    @property
+    def draft(self):
+        """A machine draft no person has reviewed yet (the flag "draft")."""
+        return 'draft' in self.flags
+
+    def set_draft(self, on):
+        self._flag('draft', on)
+
+    def _flag(self, name, on):
+        if on and name not in self.flags:
+            self.flags.append(name)
+        elif not on and name in self.flags:
+            self.flags.remove(name)
 
 
 def _quote(s):
