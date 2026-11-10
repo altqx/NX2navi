@@ -1943,6 +1943,21 @@ VkDescriptorSetLayout vk_empty_set_layout(void) {
     return PL.empty;
 }
 
+// One storage buffer for the compute stage: the buffer of the mesh fallback (MFB, tools/xlate/MeshSpirv.cs
+// ConvertFallback declares it at set 1, binding 0).
+VkDescriptorSetLayout vk_mesh_fb_set_layout(void) {
+    static VkDescriptorSetLayout layout;
+    plat_mutex_lock(&pool_lock_);
+    if (!layout) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1,
+                                              .pBindings = &b};
+        if (vkCreateDescriptorSetLayout(vk_ctx()->device, &li, NULL, &layout) != VK_SUCCESS) rt_fatal("vk: mesh fallback set layout failed");
+    }
+    plat_mutex_unlock(&pool_lock_);
+    return layout;
+}
+
 // The translator's sampler type (GfxShaderRes.type) of pool kind k.
 static uint16_t pool_kind_type(int k) {
     static const uint16_t dim[4] = {1, 3, 4, 5};   // 1D, 2D, 3D, CUBE
@@ -4610,12 +4625,19 @@ static void mesh_shading_rate(VkExec *ex) {
     ex->recorded++;
 }
 
+static void mesh_fb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind);
+
 static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     PFN_vkCmdDrawMeshTasksEXT fn = draw_mesh_fn();
-    if (!fn) return warn_once(W_MESH, "mesh draws need VK_EXT_mesh_shader: skipped");
+    if (!fn && !vk_ctx()->mesh_fallback) return warn_once(W_MESH, "mesh draws need VK_EXT_mesh_shader: skipped");
     static int on = -1;
     if (on < 0) on = rt_knob("MESH", "1");   // NX2NAVI_MESH=0: mesh draws are skipped (diagnosis)
     if (!d->count || !on) return;
+    if (!fn) {
+        if (d->first) warn_once(W_MESH, "a mesh draw from workgroup %u: drawn from workgroup 0", d->first);
+        mesh_fb_draw(ex, d->count, NULL);
+        return;
+    }
     c0_binst = 0;
     if (!prepare_draw_ex(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0, 1)) return;
     if (d->first) warn_once(W_MESH, "a mesh draw from workgroup %u: drawn from workgroup 0", d->first);
@@ -4698,6 +4720,216 @@ static int mesh_ring_entry(VkExec *ex, const VkMemSpan *src, VkDeviceSize *at) {
     return 1;
 }
 
+// ---- mesh fallback: task and mesh draws on a GPU without VK_EXT_mesh_shader (vk_ctx()->mesh_fallback)
+// The translator makes each task and mesh program a compute shader that writes what the stage would hand on into one
+// buffer (tools/xlate/MeshSpirv.cs ConvertFallback has its layout). A draw is then: the task program dispatched over the
+// task workgroups, the mesh program over (mesh workgroups a task may launch, task workgroups), or over the mesh
+// workgroups alone without a task stage, and an indexed indirect draw of the buffer with a vertex stage that passes
+// the vertices on (vk_pipeline.c mesh_fb_vertex). The compute passes end the render pass, and the draw opens it again.
+// Every draw uses the buffer from its start: the barrier before the first dispatch puts it behind the draw before.
+// NX2NAVI_MESH_FALLBACK_MB sets the buffer's size (default 128, 16 to 2048): an eighth holds task records, a quarter
+// indices and the rest vertices; a draw that needs more loses the mesh workgroups past it.
+static struct {
+    VkBuffer buf;
+    uint32_t task_at, task_words, vertex_at, vertex_words, index_at, index_words;   // areas, in 32-bit words
+    VkDescriptorPool pool;
+    VkDescriptorSet set;                 // set 1 of the compute pipelines: the buffer
+    int failed;
+    uint64_t draws, capped;              // capped: draws whose workgroup count was known and passed the buffer's room
+} MFB;
+
+static int mesh_fb_init(void) {
+    if (MFB.buf) return 1;
+    if (MFB.failed) return 0;
+    MFB.failed = 1;
+    uint64_t mb = strtoull(cfg_value("NX2NAVI_MESH_FALLBACK_MB"), NULL, 10);
+    mb = mb < 16 ? 16 : mb > 2048 ? 2048 : mb;
+    VkDeviceSize size = mb << 20, most = vk_ctx()->props.limits.maxStorageBufferRange & ~(VkDeviceSize)0xfffff;
+    if (size > most) size = most;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocation a;
+    VkBuffer buf;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &buf, &a, NULL) != VK_SUCCESS) {
+        rt_log("vk: mesh fallback: a buffer of %llu MiB could not be made (NX2NAVI_MESH_FALLBACK_MB): task and mesh draws "
+               "are skipped", (unsigned long long)(size >> 20));
+        return 0;
+    }
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1,
+                                     .pPoolSizes = &ps};
+    VkDescriptorSetLayout sl = vk_mesh_fb_set_layout();
+    VkDescriptorSetAllocateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 1,
+                                      .pSetLayouts = &sl};
+    if (vkCreateDescriptorPool(vk_ctx()->device, &pi, NULL, &MFB.pool) != VK_SUCCESS ||
+        (si.descriptorPool = MFB.pool, vkAllocateDescriptorSets(vk_ctx()->device, &si, &MFB.set) != VK_SUCCESS)) {
+        rt_log("vk: mesh fallback: its descriptor set could not be made: task and mesh draws are skipped");
+        return 0;
+    }
+    VkDescriptorBufferInfo di = {buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = MFB.set, .dstBinding = 0,
+                              .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &di};
+    vkUpdateDescriptorSets(vk_ctx()->device, 1, &w, 0, NULL);
+    uint32_t words = (uint32_t)(size / 4);
+    MFB.task_at = 16, MFB.task_words = words / 8;
+    MFB.vertex_at = MFB.task_at + MFB.task_words;
+    MFB.index_words = words / 4;
+    MFB.index_at = words - MFB.index_words;
+    MFB.vertex_words = MFB.index_at - MFB.vertex_at;
+    MFB.buf = buf, MFB.failed = 0;
+    rt_log("vk: mesh fallback: a buffer of %llu MiB (NX2NAVI_MESH_FALLBACK_MB)", (unsigned long long)(size >> 20));
+    return 1;
+}
+
+// The dispatch arguments of an indirect draw, from the game's {count, first} record src: {count, 1, 1} at *one (the
+// task program, or the mesh program without a task stage) and, with per_task, {per_task, count, 1} at *grid (the mesh
+// program after a task stage). Entries of the mesh ring, filled on the GPU as mesh_ring_entry fills its own.
+static int mesh_fb_ring(VkExec *ex, const VkMemSpan *src, uint32_t per_task, VkDeviceSize *one, VkDeviceSize *grid) {
+    if (!mesh_ring) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 12ull * MESH_RING,
+                                 .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VmaAllocation a;
+        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &mesh_ring, &a, NULL) != VK_SUCCESS) {
+            mesh_ring = VK_NULL_HANDLE;
+            return 0;
+        }
+    }
+    *one = 12ull * (mesh_ring_next++ % MESH_RING);
+    *grid = per_task ? 12ull * (mesh_ring_next++ % MESH_RING) : 0;
+    vk_exec_barrier(ex);   // ends the pass and orders the culling's writes before the copies
+    VkBufferCopy cp = {src->offset, *one, 4};
+    vkCmdFillBuffer(ex->cb, mesh_ring, *one + 4, 8, 1);
+    vkCmdCopyBuffer(ex->cb, src->buffer, mesh_ring, 1, &cp);
+    ex->recorded += 2;
+    if (per_task) {
+        cp.dstOffset = *grid + 4;
+        vkCmdFillBuffer(ex->cb, mesh_ring, *grid, 4, per_task);
+        vkCmdFillBuffer(ex->cb, mesh_ring, *grid + 8, 4, 1);
+        vkCmdCopyBuffer(ex->cb, src->buffer, mesh_ring, 1, &cp);
+        ex->recorded += 3;
+    }
+    mesh_count_note(ex, src);
+    return 1;
+}
+
+// One compute pass of a fallback draw: sh's pipeline with its stage's resources and the buffer, dispatched over
+// (x, y, 1) workgroups, or with the arguments at `at` of the mesh ring when ind is set.
+static void mesh_fb_pass(VkExec *ex, const GfxShader *sh, VkPipeline p, const VkPipeInfo *info, uint32_t x, uint32_t y,
+                         int ind, VkDeviceSize at) {
+    bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    uint64_t bt = bt_now();
+    bind_resources(ex, info);
+    vk_exec_frame.bind_ns += (uint64_t)(bt_now() - bt);
+    vk_exec_frame.bind_calls++;
+    vkCmdBindDescriptorSets(ex->cb, VK_PIPELINE_BIND_POINT_COMPUTE, info->layout, 1, 1, &MFB.set, 0, NULL);
+    VkPassMark *m = dispatch_mark(ex, sh, ind ? 0 : x, ind ? 0 : y, ind ? 0 : 1);
+    if (ind) vkCmdDispatchIndirect(ex->cb, mesh_ring, at);
+    else vkCmdDispatch(ex->cb, x, y, 1);
+    vk_pass_mark_end(ex->cb, m);
+    ex->recorded += 2;
+    vk_exec_barrier(ex);   // what it wrote is there for the next pass or the draw
+}
+
+// A task or mesh draw of `count` workgroups, or of the count in the game's record ind (an indirect draw).
+static void mesh_fb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
+    if (ex->render_disabled || !ex->prog) {   // counted and logged there; nothing is drawn
+        prepare_draw_ex(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0, 1);
+        return;
+    }
+    cb_res(ex);
+    dummies_init();
+    int has_ms, has_ts, ms_wait = 0, ts_wait = 0;
+    const GfxShader *ms = shader_for(ex, NVN_STAGE_MESH, &has_ms, &ms_wait, 0);
+    const GfxShader *ts = shader_for(ex, NVN_STAGE_TASK, &has_ts, &ts_wait, 0);
+    if (!has_ms) return (void)draw_skipped(ex, 1, SK_NO_VERTEX_STAGE);
+    if (ms_wait || ts_wait) return (void)(perf_count(PERF_CNT_SHADER_SKIP), draw_skipped(ex, 1, SK_SHADER_PENDING));
+    if (!ms || (has_ts && !ts)) return (void)draw_skipped(ex, 1, SK_SHADER_FAILED);
+    const GfxMeshFallback *mf = gfx_shader_mesh_fallback(ms), *tf = ts ? gfx_shader_mesh_fallback(ts) : NULL;
+    int task = mf->has_task;
+    if (mf->stage != 7 || !mf->stride_words || !mf->max_vertices || !mf->max_primitives || !mf->indices ||
+        (task && (!tf || tf->stage != 6))) {
+        warn_once(W_MESH, "a mesh draw whose programs are not translated for the mesh fallback: skipped");
+        return (void)draw_skipped(ex, 1, SK_SHADER_FAILED);
+    }
+    if (shader_skipped(ms) || (task && shader_skipped(ts))) return (void)draw_skipped(ex, 1, SK_POOL_OFF);
+    const VkPipeInfo *im = NULL, *it = NULL;
+    VkPipeline pm = vk_pipeline_compute(ms, &im), pt = task ? vk_pipeline_compute(ts, &it) : VK_NULL_HANDLE;
+    if (!pm || !im || (task && (!pt || !it))) {
+        warn_once(W_PIPELINE, "a compute pipeline of the mesh fallback could not be created: draws with it are skipped");
+        return (void)draw_skipped(ex, 1, SK_PIPE_FAILED);
+    }
+    if (((im->pool || (task && it->pool)) && !pool_on()) || !mesh_fb_init()) return (void)draw_skipped(ex, 1, SK_POOL_OFF);
+
+    // What the buffer holds of this draw: task records, and slots (one per mesh workgroup that draws)
+    uint32_t slot_indices = (uint32_t)mf->max_primitives * mf->indices;
+    uint32_t record = 2 + (task && tf->payload_words > mf->payload_words ? tf->payload_words : mf->payload_words);
+    uint32_t task_cap = task ? MFB.task_words / record : 0;
+    uint32_t slot_cap = (MFB.vertex_words / mf->stride_words - 1) / mf->max_vertices, by_index = MFB.index_words / slot_indices;
+    if (by_index < slot_cap) slot_cap = by_index;
+    uint32_t per_task = task ? (tf->threads < 32 ? tf->threads : 32) : 0;
+    MFB.draws++;
+    if (!ind && count > (task ? task_cap : slot_cap)) {
+        if (!MFB.capped++)
+            rt_log("vk: mesh fallback: a draw of %u %s workgroups passes the buffer's room for %u: the rest is not drawn "
+                   "(NX2NAVI_MESH_FALLBACK_MB)", count, task ? "task" : "mesh", task ? task_cap : slot_cap);
+        count = task ? task_cap : slot_cap;
+    }
+    VkDeviceSize one = 0, grid = 0;
+    if (ind && !mesh_fb_ring(ex, ind, per_task, &one, &grid)) {
+        warn_once(W_MESH, "the indirect mesh ring could not be created: skipped");
+        return (void)draw_skipped(ex, 1, SK_PIPE_FAILED);
+    }
+    vk_exec_barrier(ex);   // ends the pass; the draw before this one is through with the buffer
+
+    // The header (a VkDrawIndexedIndirectCommand, then the limits and areas) and vertex 0, which no primitive that
+    // draws uses: a position behind the eye, so the corners of the primitives a slot does not fill are clipped.
+    VkBuffer sb;
+    VkDeviceSize so;
+    uint32_t *h = (uint32_t *)scratch(ex, 80, &sb, &so);
+    memset(h, 0, 80);
+    h[1] = 1, h[5] = task_cap, h[6] = slot_cap, h[7] = MFB.task_at, h[8] = MFB.vertex_at, h[9] = MFB.index_at;
+    h[10] = slot_indices, h[12] = record;
+    h[19] = 0xbf800000;   // (0, 0, 0, -1)
+    VkBufferCopy cp[2] = {{so, 0, 64}, {so + 64, 4ull * MFB.vertex_at, 16}};
+    vkCmdCopyBuffer(ex->cb, sb, MFB.buf, 2, cp);
+    ex->recorded++;
+    vk_exec_barrier(ex);
+
+    c0_binst = 0;
+    if (task) {
+        mesh_fb_pass(ex, ts, pt, it, count, 1, ind != NULL, one);
+        mesh_fb_pass(ex, ms, pm, im, per_task, count, ind != NULL, grid);
+    } else {
+        mesh_fb_pass(ex, ms, pm, im, count, 1, ind != NULL, one);
+    }
+
+    int prim = mf->indices == 1 ? NVN_DRAW_PRIMITIVE_POINTS : mf->indices == 2 ? NVN_DRAW_PRIMITIVE_LINES : NVN_DRAW_PRIMITIVE_TRIANGLES;
+    if (!prepare_draw_ex(ex, prim, 0x7fffffff, 0, 1)) return;
+    vk_exec_frame.draws++;
+    static uint32_t n_logged;
+    if (n_logged < 8 && knob_log_mesh()) {
+        n_logged++;
+        rt_log("vk: mesh fallback draw: %s%u workgroups%s, program %llu, room for %u task records and %u slots",
+               ind ? "indirect, " : "", count, task ? " of the task program" : "", (unsigned long long)ex->prog->serial,
+               task_cap, slot_cap);
+    }
+    mesh_shading_rate(ex);
+    VkDeviceSize vo = 4ull * MFB.vertex_at, vs = 4ull * MFB.vertex_words;
+    vkCmdBindVertexBuffers2(ex->cb, 0, 1, &MFB.buf, &vo, &vs, NULL);
+    B.vb_valid = 0;   // the next vertex draw binds its buffers again
+    vkCmdBindIndexBuffer(ex->cb, MFB.buf, 4ull * MFB.index_at, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexedIndirect(ex->cb, MFB.buf, 0, 1, sizeof(VkDrawIndexedIndirectCommand));
+    ex->recorded += 3;
+    // The draw's pipeline holds its topology, primitive restart and vertex input as fixed state, unlike a mesh pipeline,
+    // which has none: binding it left the command buffer's dynamic values of those undefined, so the next vertex draw
+    // records them again.
+    B.dyn.have &= ~VK_DYN_VTX;
+}
+
 // DrawMeshTasksIndirect: one draw from its ring entry (mesh_ring_entry); x2-x4 of the call vary like leftovers, so they
 // are not read as a count or stride.
 static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
@@ -4708,7 +4940,7 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
         if (vk_ctx()->has_mesh_shader)
             fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vk_dpa(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
     }
-    if (!fn) return warn_once(W_MESH, "mesh draws need VK_EXT_mesh_shader: skipped");
+    if (!fn && !vk_ctx()->mesh_fallback) return warn_once(W_MESH, "mesh draws need VK_EXT_mesh_shader: skipped");
     static int on = -1;
     if (on < 0) on = rt_knob("MESH", "1");
     if (!on) return;
@@ -4718,6 +4950,12 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
                          (unsigned long long)d->ind);
     c0_binst = 0;
     VK_MEM_USE(ip);
+    if (!fn) {
+        mesh_fb_draw(ex, 0, &ip);
+        vk_mem_count(ip.cls, VK_MUSE_IND, 4);
+        VK_MEM_BOUND(ip);
+        return;
+    }
     VkDeviceSize at;
     if (!mesh_ring_entry(ex, &ip, &at)) return warn_once(W_MESH, "the indirect mesh ring could not be created: skipped");
     if (!prepare_draw_ex(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0, 1)) return;

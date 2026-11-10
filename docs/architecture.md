@@ -128,7 +128,11 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   their stand-in, and the frame's later refreshes skip them (`runtime/vk_exec_draw.c` `pool_refill`). An area load
   spreads over several frames instead of holding one for 200-400 ms.
 - Mesh and task shaders run as `VK_EXT_mesh_shader`; indirect mesh draws read NVN's `{count, first}` record through a
-  ring of Vulkan `{x, y, z}` records filled on the GPU.
+  ring of Vulkan `{x, y, z}` records filled on the GPU. On a card without that extension the translator makes each
+  task and mesh program a compute shader that writes its vertices and indices into one buffer
+  (`tools/xlate/MeshSpirv.cs` `ConvertFallback`), and a draw dispatches them and then draws the buffer with a
+  generated vertex stage (`runtime/vk_exec_draw.c` `mesh_fb_draw`, `runtime/vk_pipeline.c` `mesh_fb_vertex`).
+  `NX2NAVI_MESH_FALLBACK=0` skips those draws instead.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
   at a new state, an optimised pipeline replacing it from a background thread. A draw whose pipeline is not ready is
   skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise. Three things keep

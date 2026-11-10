@@ -2073,6 +2073,7 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
 }
 
 static VkShaderStageFlags stage_bit(int stage) {
+    if ((stage == GFX_STAGE_TS || stage == GFX_STAGE_MS) && vk_ctx()->mesh_fallback) return VK_SHADER_STAGE_COMPUTE_BIT;
     return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT
          : stage == GFX_STAGE_TS ? VK_SHADER_STAGE_TASK_BIT_EXT : stage == GFX_STAGE_MS ? VK_SHADER_STAGE_MESH_BIT_EXT
                                                                  : VK_SHADER_STAGE_COMPUTE_BIT;
@@ -2242,7 +2243,9 @@ static Layout *layout_get(Bindings *B) {
         free(l);
         return NULL;
     }
-    VkDescriptorSetLayout sets3[3] = {l->set, vk_empty_set_layout(), vk_pool_set_layout()};   // set 2: the pools
+    // set 1: empty, or with the mesh fallback the buffer its compute shaders write (only they use it); set 2: the pools
+    VkDescriptorSetLayout sets3[3] = {l->set, vk_ctx()->mesh_fallback ? vk_mesh_fb_set_layout() : vk_empty_set_layout(),
+                                      vk_pool_set_layout()};
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 3,
                                      .pSetLayouts = sets3};
     if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout) != VK_SUCCESS) {
@@ -2590,14 +2593,102 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+// The vertex stage of a mesh fallback draw (vk_exec_draw.c "mesh fallback"): it passes on what the mesh program wrote
+// into the fallback buffer as a compute shader. Inputs: Location 0 the position, then one Location per generic vector
+// of mf->locations in ascending order, then the point size. Outputs: the position, generic vector g at Location g and
+// the point size (1 for a point program that writes none). A Location of `extra` the mesh program does not write, which
+// the fragment shader reads all the same, is (0, 0, 0, 1). Returns malloc'd SPIR-V, its length in *words.
+static uint32_t *mesh_fb_vertex(const GfxMeshFallback *mf, uint32_t extra, uint64_t *words) {
+    enum { T_VOID = 1, T_FN, T_FLOAT, T_V4, P_IN4, P_OUT4, P_INF, P_OUTF, C_0, C_1, C_DEF, F_MAIN, L_MAIN, V_POS_IN, V_POS_OUT,
+           V_PS_IN, V_PS_OUT, ID_FIRST };
+    enum { DEC_BUILTIN = 11, DEC_LOCATION = 30, SC_INPUT = 1, SC_OUTPUT = 3 };
+    uint32_t in_var[32], out_var[32], id = ID_FIRST, n = 0, outs = mf->locations | extra;
+    int ps_out = mf->point_size || mf->indices == 1;
+    for (int g = 0; g < 32; g++) {
+        in_var[g] = mf->locations >> g & 1 ? id++ : 0;
+        out_var[g] = outs >> g & 1 ? id++ : 0;
+    }
+    uint32_t *w = malloc(2048 * sizeof *w);   // 32 vectors take under 1,200 words
+    if (!w) return NULL;
+#define W(x) (w[n++] = (uint32_t)(x))
+#define DECORATE(v, dec, value) (W(4 << 16 | 71), W(v), W(dec), W(value))
+#define VARIABLE(ptr, v, sc) (W(4 << 16 | 59), W(ptr), W(v), W(sc))
+    W(0x07230203), W(0x00010300), W(0), W(0), W(0);   // the id bound is filled in below
+    W(2 << 16 | 17), W(1);                            // OpCapability Shader
+    W(3 << 16 | 14), W(0), W(1);                      // OpMemoryModel Logical GLSL450
+    uint32_t ep = n;                                  // OpEntryPoint Vertex %main "main" and every variable
+    W(0), W(0), W(F_MAIN), W(0x6e69616d), W(0), W(V_POS_IN), W(V_POS_OUT);
+    if (mf->point_size) W(V_PS_IN);
+    if (ps_out) W(V_PS_OUT);
+    for (int g = 0; g < 32; g++) {
+        if (in_var[g]) W(in_var[g]);
+        if (out_var[g]) W(out_var[g]);
+    }
+    w[ep] = (n - ep) << 16 | 15;
+    uint32_t loc = 1;
+    DECORATE(V_POS_IN, DEC_LOCATION, 0), DECORATE(V_POS_OUT, DEC_BUILTIN, 0);   // BuiltIn Position
+    for (int g = 0; g < 32; g++) {
+        if (in_var[g]) DECORATE(in_var[g], DEC_LOCATION, loc++);
+        if (out_var[g]) DECORATE(out_var[g], DEC_LOCATION, g);
+    }
+    if (mf->point_size) DECORATE(V_PS_IN, DEC_LOCATION, loc);
+    if (ps_out) DECORATE(V_PS_OUT, DEC_BUILTIN, 1);   // BuiltIn PointSize
+    W(2 << 16 | 19), W(T_VOID);
+    W(3 << 16 | 33), W(T_FN), W(T_VOID);
+    W(3 << 16 | 22), W(T_FLOAT), W(32);
+    W(4 << 16 | 23), W(T_V4), W(T_FLOAT), W(4);
+    W(4 << 16 | 32), W(P_IN4), W(SC_INPUT), W(T_V4);
+    W(4 << 16 | 32), W(P_OUT4), W(SC_OUTPUT), W(T_V4);
+    W(4 << 16 | 32), W(P_INF), W(SC_INPUT), W(T_FLOAT);
+    W(4 << 16 | 32), W(P_OUTF), W(SC_OUTPUT), W(T_FLOAT);
+    W(4 << 16 | 43), W(T_FLOAT), W(C_0), W(0);
+    W(4 << 16 | 43), W(T_FLOAT), W(C_1), W(0x3f800000);
+    W(7 << 16 | 44), W(T_V4), W(C_DEF), W(C_0), W(C_0), W(C_0), W(C_1);
+    VARIABLE(P_IN4, V_POS_IN, SC_INPUT), VARIABLE(P_OUT4, V_POS_OUT, SC_OUTPUT);
+    if (mf->point_size) VARIABLE(P_INF, V_PS_IN, SC_INPUT);
+    if (ps_out) VARIABLE(P_OUTF, V_PS_OUT, SC_OUTPUT);
+    for (int g = 0; g < 32; g++) {
+        if (in_var[g]) VARIABLE(P_IN4, in_var[g], SC_INPUT);
+        if (out_var[g]) VARIABLE(P_OUT4, out_var[g], SC_OUTPUT);
+    }
+    W(5 << 16 | 54), W(T_VOID), W(F_MAIN), W(0), W(T_FN);
+    W(2 << 16 | 248), W(L_MAIN);
+    uint32_t t = id++;
+    W(4 << 16 | 61), W(T_V4), W(t), W(V_POS_IN), W(3 << 16 | 62), W(V_POS_OUT), W(t);
+    for (int g = 0; g < 32; g++) {
+        if (!out_var[g]) continue;
+        if (!in_var[g]) { W(3 << 16 | 62), W(out_var[g]), W(C_DEF); continue; }
+        t = id++;
+        W(4 << 16 | 61), W(T_V4), W(t), W(in_var[g]), W(3 << 16 | 62), W(out_var[g]), W(t);
+    }
+    if (mf->point_size) {
+        t = id++;
+        W(4 << 16 | 61), W(T_FLOAT), W(t), W(V_PS_IN), W(3 << 16 | 62), W(V_PS_OUT), W(t);
+    } else if (ps_out) {
+        W(3 << 16 | 62), W(V_PS_OUT), W(C_1);
+    }
+    W(1 << 16 | 253), W(1 << 16 | 56);
+#undef W
+#undef DECORATE
+#undef VARIABLE
+    w[3] = id;
+    *words = n;
+    return w;
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw, vm_hash = 0, fm_hash = 0;   // the hashes: of the final modules, for the PIPE_FEEDBACK 2 line
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
     int mesh = is_mesh(s);
+    // The mesh fallback: the mesh and task programs are compute pipelines (vk_pipeline_compute), and this pipeline draws
+    // what they wrote with a generated vertex stage (mesh_fb_vertex), no dynamic vertex input and the mesh program's
+    // primitive type.
+    const GfxMeshFallback *mf = mesh && vk_ctx()->mesh_fallback ? gfx_shader_mesh_fallback(s->vs) : NULL;
+    if (mf && mf->stage != 7) return VK_NULL_HANDLE;
     VkShaderModule tm = VK_NULL_HANDLE;
-    if (mesh && s->ts) {   // the task stage's bindings follow the fragment stage's (pipe_miss)
+    if (mesh && !mf && s->ts) {   // the task stage's bindings follow the fragment stage's (pipe_miss)
         uint64_t tw;
         const uint32_t *tcode = gfx_shader_spirv(s->ts, &tw);
         uint32_t toff = fs_off + (s->fs ? binding_span(s->fs) - 1 : 0);
@@ -2617,14 +2708,17 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     if (s->fs) {
         GfxShaderIo fin[32], vout[32];
-        uint32_t need = gfx_shader_inputs(s->fs, fin), have = mesh ? ~0u : gfx_shader_outputs(s->vs, vout), missing = 0;
+        uint32_t need = gfx_shader_inputs(s->fs, fin), missing = 0;
+        uint32_t have = mf ? mf->locations : mesh ? ~0u : gfx_shader_outputs(s->vs, vout);
         for (int i = 0; i < 32; i++) {
             if (!(need >> i & 1) || fin[i].packed) continue;
             if (!(have >> i & 1)) missing |= 1u << i;
             else if (!mesh && vout[i].type != fin[i].type)
                 LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
         }
-        if (missing && !l->set1) {
+        if (mf) {
+            vcode = vpatched = mesh_fb_vertex(mf, missing, &vw);
+        } else if (missing && !l->set1) {
             uint64_t n2 = 0;
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
@@ -2645,14 +2739,15 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
         if (fcode) fm = make_module(fcode, fw, !k->a2c), fm_hash = mm_hash;
     }
-    vm = make_module(vcode, vw, 0), vm_hash = mm_hash;
+    if (mf && !s->fs) vcode = vpatched = mesh_fb_vertex(mf, 0, &vw);
+    vm = vcode ? make_module(vcode, vw, 0) : VK_NULL_HANDLE, vm_hash = mm_hash;
     free(vpatched), free(fpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (!vm || (s->fs && !fm) || (mesh && s->ts && !tm)) goto out;
+    if (!vm || (s->fs && !fm) || (mesh && !mf && s->ts && !tm)) goto out;   // the fallback has no task stage here
 
     VkPipelineShaderStageCreateInfo stages[3] = {
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT,
-         .module = vm, .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = mesh && !mf ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT, .module = vm, .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TASK_BIT_EXT, .module = tm, .pName = "main"}};
     uint32_t n_stages = 1;
@@ -2664,12 +2759,18 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
     uint64_t sw;
     const uint32_t *scode = gfx_shader_spirv(s->vs, &sw);   // vcode may be a patched copy that is freed by now
-    pin_subgroup32(&stages[0], &rqv, scode, sw);
+    if (!mf) pin_subgroup32(&stages[0], &rqv, scode, sw);   // the fallback's vertex stage has no subgroup operations
     if (s->fs) pin_subgroup32(&stages[1], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     uint32_t na = 0, nb = 0;
-    if (!P.dyn_vi) {
+    if (mf) {   // the vertices as the mesh program's compute shader wrote them (GfxMeshFallback.stride_words)
+        vb[nb++] = (VkVertexInputBindingDescription){0, mf->stride_words * 4u, VK_VERTEX_INPUT_RATE_VERTEX};
+        va[na++] = (VkVertexInputAttributeDescription){0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+        for (int g = 0; g < 32; g++)
+            if (mf->locations >> g & 1) va[na] = (VkVertexInputAttributeDescription){na, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16 * na}, na++;
+        if (mf->point_size) va[na] = (VkVertexInputAttributeDescription){na, 0, VK_FORMAT_R32_SFLOAT, 16 * na}, na++;
+    } else if (!P.dyn_vi) {
         VtxInput v;
         vertex_input(s, &v);
         for (uint32_t i = 0; i < v.n_attr; i++) va[na++] = (VkVertexInputAttributeDescription){v.a[i].location, v.a[i].binding, v.a[i].format, v.a[i].offset};
@@ -2681,7 +2782,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     static const VkPrimitiveTopology class_base[4] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
                                                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_PATCH_LIST};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                                                 .topology = class_base[k->topo_class]};
+                                                 .topology = class_base[mf ? mf->indices - 1 : k->topo_class]};
     VkPipelineViewportDepthClipControlCreateInfoEXT clip = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
                                                             .negativeOneToOne = k->minus_w};
     VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &clip};
@@ -2728,8 +2829,8 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                         .pColorAttachmentFormats = (const VkFormat *)k->color,
                                         .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
-                                       .stageCount = n_stages, .pStages = stages, .pVertexInputState = mesh ? NULL : &vi,
-                                       .pInputAssemblyState = mesh ? NULL : &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+                                       .stageCount = n_stages, .pStages = stages, .pVertexInputState = mesh && !mf ? NULL : &vi,
+                                       .pInputAssemblyState = mesh && !mf ? NULL : &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
                                        .pDynamicState = &dy, .layout = l->layout, .flags = noopt_flag()};
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
@@ -3667,7 +3768,24 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         // vertex pipelines). They go to the workers like the others: built here, each new one stopped the frame for its
         // whole compile (0.26-0.51 s in Kokiri Forest), and they are recorded for the boot prewarm (keys_note).
         uint32_t fspan = s->fs ? binding_span(s->fs) : 1;
-        if (!vk_ctx()->has_mesh_shader) why = "the GPU has no mesh shaders";
+        if (vk_ctx()->mesh_fallback) {
+            // The mesh fallback: the draw has a generated vertex stage without resources (mesh_fb_vertex) and the
+            // fragment stage, so the set holds the fragment stage's bindings alone; the task and mesh programs are
+            // compute pipelines of their own (vk_pipeline_compute).
+            span = 1;
+            if (gfx_shader_mesh_fallback(s->vs)->stage != 7) why = "the mesh program is not translated for the mesh fallback";
+            else if (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) why = "stage mismatch";
+            else if (s->fs && !add_stage(&B, s->fs, 0)) why = "too many bindings";
+            else {
+                if (!s->fs) {   // the support buffer alone, as add_stage starts a list
+                    B.b[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+                    B.pb[0] = (VkPipeBinding){0, GFX_STAGE_FS, VK_PIPE_SUPPORT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                              VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+                    B.n = 1;
+                }
+                if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
+            }
+        } else if (!vk_ctx()->has_mesh_shader) why = "the GPU has no mesh shaders";
         else if ((s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) || (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS)) why = "stage mismatch";
         else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
                  (s->ts && !add_stage(&B, s->ts, span - 1 + fspan - 1))) why = "too many bindings";
@@ -3683,7 +3801,10 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     } else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1))) why = "too many bindings";
     else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
     char lack[128];
-    if (!why && !layout_covers(s, l, span - 1, lack, sizeof lack)) why = lack, l = NULL;
+    if (!why && mesh && vk_ctx()->mesh_fallback) {   // the mesh module is not a stage of this pipeline
+        int m = s->fs ? module_binding_missing(s->fs, l->b, l->n, 0) : -1;
+        if (m >= 0) snprintf(lack, sizeof lack, "the fragment shader uses binding %d, which its reflection and layout lack", m), why = lack, l = NULL;
+    } else if (!why && !layout_covers(s, l, span - 1, lack, sizeof lack)) why = lack, l = NULL;
     VkPipeline pipe = VK_NULL_HANDLE;
     Job *j = NULL;
     if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
@@ -4384,7 +4505,10 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cache
 // The layout of a compute shader in *B; NULL with *why on failure. Caller holds P.lock.
 static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why) {
     Layout *l = NULL;
-    if (gfx_shader_stage(cs) != GFX_STAGE_CS) *why = "not a compute shader";
+    int stage = gfx_shader_stage(cs);
+    // with the mesh fallback a task or mesh program is a compute shader too (GfxMeshFallback)
+    if (stage != GFX_STAGE_CS && !((stage == GFX_STAGE_TS || stage == GFX_STAGE_MS) && gfx_shader_mesh_fallback(cs)->stage))
+        *why = "not a compute shader";
     else if (!add_stage(B, cs, 0)) *why = "too many bindings";
     else if (!(l = layout_get(B))) *why = "descriptor layout creation failed";
     return l;

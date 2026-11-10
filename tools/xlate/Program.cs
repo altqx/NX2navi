@@ -164,6 +164,7 @@ static class SwshXlate
             {
                 byte[] code = File.ReadAllBytes((string)job["code"]);
                 AmpereLowering.MeshInfo mesh = null;
+                bool meshFallback = false;   // "mesh": {"fallback": true}: the GPU has no mesh shaders (MeshSpirv.ConvertFallback)
                 // "sm86": true: the code is an NVN2 (Switch 2) program as stored, "size" bytes long (control section +0x38);
                 // it is lowered to Maxwell first (AmpereLowering.cs). "lowered_out": a path that receives the Maxwell code.
                 if (job["sm86"] is JsonValue sm && sm.TryGetValue<bool>(out bool isSm86) && isSm86)
@@ -181,6 +182,7 @@ static class SwshXlate
                             MaxPrimitives = (int)mj["maxp"], Topology = (int)mj["topo"], PayloadBytes = (int)mj["payload"],
                             HasTask = mj["task"] is JsonValue tv && tv.TryGetValue<bool>(out bool tb) && tb,
                         };
+                        meshFallback = mj["fallback"] is JsonValue fv && fv.TryGetValue<bool>(out bool fb) && fb;
                         // The size field counts 256-byte units, and some task programs and the mesh programs they feed
                         // carry 0 there while the payload is used (the task writes the mesh count at +4, the mesh reads
                         // ISBERD region 7 at 0x10 and 0x14): a payload under 256 bytes rounds down. One unit covers it.
@@ -223,7 +225,7 @@ static class SwshXlate
                 if (mesh != null)
                 {
                     if (job["compute_out"] is JsonNode co) File.WriteAllBytes((string)co, spirv);
-                    spirv = MeshSpirv.Convert(spirv, mesh);
+                    spirv = meshFallback ? MeshSpirv.ConvertFallback(spirv, mesh) : MeshSpirv.Convert(spirv, mesh);
                 }
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), spirv);
                 var res = new JsonObject
@@ -237,6 +239,25 @@ static class SwshXlate
                 if (mesh != null)
                     res["mesh"] = new JsonObject { ["lines"] = mesh.Lines.Count, ["shared"] = mesh.SharedBytes,
                         ["outputs"] = new JsonArray(MeshSpirv.GenericLocations(mesh).Select(x => (JsonNode)x).ToArray()) };
+                if (meshFallback)
+                {
+                    // What the runtime needs to dispatch the program and draw what it wrote (runtime/gfx_shader.c
+                    // GfxMeshFallback): fb_stage 6 a task program, 7 a mesh program.
+                    res["fb_stage"] = mesh.Stage;
+                    res["fb_threads"] = Math.Max(1, mesh.Threads);
+                    res["fb_payload_words"] = mesh.Stage == 6 || mesh.HasTask ? mesh.PayloadBytes / 4 : 0;
+                    if (mesh.Stage == 7)
+                    {
+                        res["fb_has_task"] = mesh.HasTask ? 1 : 0;
+                        res["fb_max_vertices"] = mesh.MaxVertices;
+                        res["fb_max_primitives"] = mesh.MaxPrimitives;
+                        res["fb_indices"] = mesh.IndicesPerPrimitive;
+                        res["fb_stride_words"] = MeshSpirv.FallbackStride(mesh);
+                        res["fb_point_size"] = MeshSpirv.FallbackPointSize(mesh) ? 1 : 0;
+                        // as a signed 32-bit number: the runtime reads it with strtol, 32 bits wide on Windows
+                        res["fb_locations"] = unchecked((int)MeshSpirv.GenericLocations(mesh).Aggregate(0u, (a, g) => a | 1u << g));
+                    }
+                }
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
                 foreach (var b in p.Info.SBuffers)
                 {

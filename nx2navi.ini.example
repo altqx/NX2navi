@@ -288,6 +288,14 @@
 # compiler reads "AMD proprietary shader compiler" in the log), where the black and white blocks were reported; off
 # elsewhere. The first start after a change compiles the pipelines again.
 # vk_nan_bits = 1
+# A graphics card without mesh shaders (NVIDIA before the GTX 16 series, AMD before the RX 6000 series, Intel before
+# Arc): 1 runs the game's task and mesh programs as compute shaders and draws what they write, so the grass, the
+# foliage and the effects made that way are drawn; 0 skips those draws, which is faster and leaves them out. Has no
+# effect on a card with mesh shaders. The first start after a change translates the shaders again.
+# mesh_fallback = 0
+# The video memory those compute shaders write a draw's vertices into, in MiB (16 to 2048). The log names a draw that
+# needs more ("passes the buffer's room"); its far end is then not drawn.
+# mesh_fallback_mb = 128
 
 [display]
 # Device profile: auto (the Steam Deck when this is one), desktop or deck. On a Steam Deck the keys this file does not

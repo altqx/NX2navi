@@ -446,8 +446,13 @@ static int create_device(void) {
         g_vk.has_mesh_queries = want && c->mesh.meshShaderQueries && h->pipelineStatisticsQuery && c->f12.hostQueryReset;
         c->mesh.meshShaderQueries = g_vk.has_mesh_queries ? VK_TRUE : VK_FALSE;
         if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
-        rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+    // Without them (NVIDIA before the GTX 16 series, AMD before the RX 6000 series, Intel before Arc) the game's foliage,
+    // grass and many effects would not be drawn. NX2NAVI_MESH_FALLBACK=0 skips those draws instead.
+    g_vk.mesh_fallback = !g_vk.has_mesh_shader && cfg_bool("NX2NAVI_MESH_FALLBACK");
+    rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader"
+           : g_vk.mesh_fallback ? "not supported: task and mesh programs run as compute shaders (NX2NAVI_MESH_FALLBACK=0 skips their draws)"
+                                : "not supported (task/mesh draws are skipped)");
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;

@@ -38,6 +38,8 @@ typedef struct VkCtx {
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
         has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
         has_mesh_shader, has_vrs,           // VK_EXT_mesh_shader with taskShader and meshShader (NVN2 task/mesh stages)
+        mesh_fallback,                      // no mesh shaders: task and mesh programs run as compute shaders and their
+                                            // output is drawn from a buffer (vk_exec_draw.c "mesh fallback")
         has_maximal_reconvergence,          // VK_KHR_shader_maximal_reconvergence (vk_pipeline.c spirv_reconverge)
         has_pipeline_binary,                // VK_KHR_pipeline_binary with VK_KHR_maintenance5 (vk_pipeline.c pipe_create)
         has_mesh_queries;                   // meshShaderQueries, kept while NX2NAVI_GPU_PASSES or NX2NAVI_DUMP is set
@@ -540,6 +542,7 @@ uint64_t vk_pool_takes(void);
 void vk_texture_pool_ctx(int on);
 VkDescriptorSetLayout vk_pool_set_layout(void);     // the pools' layout (made on first use)
 VkDescriptorSetLayout vk_empty_set_layout(void);    // set 1 of layouts without one
+VkDescriptorSetLayout vk_mesh_fb_set_layout(void);  // set 1 with the mesh fallback: the buffer its compute shaders write
 // The upscaler stand-in (vk_tonemap.c): src (sampled) scaled to dw x dh and tonemapped into its own RGBA16F image, which
 // it returns for the caller to blit into the target; VK_NULL_HANDLE when it cannot. The caller binds its own compute
 // pipeline again afterwards.

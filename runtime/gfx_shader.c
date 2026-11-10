@@ -127,6 +127,7 @@ struct GfxShader {
     uint32_t mvprev_banks;                                 // .res.json "mvprev_banks" (patch 0015), 0 none
     uint32_t omap;                                         // FS: .res.json "frag_out_map", the colour components it writes
                                                            // (4 bits per target, the SPH omap); 0 unknown (older translations)
+    GfxMeshFallback mesh_fb;                               // .res.json "fb_*" (a task or mesh program as a compute shader)
     uint8_t carried;                                       // 1 + the previous identity (C.prev) that translated it; 0 the
                                                            // current translator
 };
@@ -162,7 +163,7 @@ static char cache_dir[PATH_CAP];
 static char xlate_exe[PATH_CAP];
 static uint8_t xlate_id[32];                               // translator identity (see the keys at the top)
 static uint8_t xlate_base[32];                             // the same before gfx_shader_set_host mixes in host options
-static int host_f64 = 1, host_zero_locals, host_bda, host_set;                         // gfx_shader_set_host
+static int host_f64 = 1, host_zero_locals, host_bda, host_mesh_fb, host_set;           // gfx_shader_set_host
 static uint32_t host_sbuf, host_sg[3] = {32, 32, 32}, host_gather;
 static PlatOnce paths_once = PLAT_ONCE_INIT;
 
@@ -386,12 +387,13 @@ static void paths(void) { plat_once(&paths_once, init_paths, NULL); }
 // defaults, which are not mixed in.
 static int host_text(char *t) {
     if (host_f64 && !host_sbuf && host_sg[0] == 32 && host_sg[1] == 32 && host_sg[2] == 32 && !host_gather &&
-        !host_zero_locals && !host_bda)
+        !host_zero_locals && !host_bda && !host_mesh_fb)
         return 0;
     int n = snprintf(t, 96, "TKHO f64=%d sbuf=%u sg=%u,%u,%u", host_f64, host_sbuf, host_sg[0], host_sg[1], host_sg[2]);
     if (host_gather) n += snprintf(t + n, (size_t)(96 - n), " gather=%u", host_gather);
     if (host_zero_locals) n += snprintf(t + n, (size_t)(96 - n), " zero_locals");
     if (host_bda) n += snprintf(t + n, (size_t)(96 - n), " bda");
+    if (host_mesh_fb) n += snprintf(t + n, (size_t)(96 - n), " meshfb");
     return n;
 }
 
@@ -411,10 +413,11 @@ static void host_mix(const uint8_t base[32], uint8_t out[32]) {
 // exact storage offsets, 32 lanes, no gather bias, undefined locals) are mixed into the translator identity, so they
 // get their own cache keys. The previous identities of identities.txt get the same options mixed in (carry).
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
-                         int bda) {
+                         int bda, int mesh_fallback) {
     paths();
     if (host_set++) return;
     host_f64 = float64, host_sbuf = sbuf_align, host_gather = gather_bits, host_zero_locals = zero_locals, host_bda = bda;
+    host_mesh_fb = mesh_fallback;
     memcpy(host_sg, subgroup, sizeof host_sg);
     char t[96];
     int n = host_text(t);
@@ -1187,6 +1190,17 @@ static void reflect(GfxShader *s) {
     reflect_stage(s);
     s->mvprev_banks = (uint32_t)json_int(js, js + strlen(js), "mvprev_banks", 0);
     s->omap = s->stage == GFX_STAGE_FS ? (uint32_t)json_int(js, js + strlen(js), "frag_out_map", 0) : 0;
+    if (s->stage == GFX_STAGE_TS || s->stage == GFX_STAGE_MS) {
+        const char *je = js + strlen(js);
+        s->mesh_fb = (GfxMeshFallback){
+            .stage = (uint8_t)json_int(js, je, "fb_stage", 0), .has_task = (uint8_t)json_int(js, je, "fb_has_task", 0),
+            .indices = (uint8_t)json_int(js, je, "fb_indices", 0), .point_size = (uint8_t)json_int(js, je, "fb_point_size", 0),
+            .threads = (uint16_t)json_int(js, je, "fb_threads", 0), .max_vertices = (uint16_t)json_int(js, je, "fb_max_vertices", 0),
+            .max_primitives = (uint16_t)json_int(js, je, "fb_max_primitives", 0),
+            .stride_words = (uint16_t)json_int(js, je, "fb_stride_words", 0),
+            .payload_words = (uint32_t)json_int(js, je, "fb_payload_words", 0),
+            .locations = (uint32_t)json_int(js, je, "fb_locations", 0)};
+    }
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
@@ -1555,9 +1569,9 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
             // mesh stage; +0x60 vertex limit (low 16 bits) and primitive limit (high 16 bits).
             uint32_t w58, w5c, w60;
             memcpy(&w58, control + 0x58, 4), memcpy(&w5c, control + 0x5c, 4), memcpy(&w60, control + 0x60, 4);
-            o += sprintf(o, ",\"mesh\":{\"stage\":%d,\"threads\":%u,\"payload\":%u,\"maxv\":%u,\"maxp\":%u,\"topo\":%u,\"task\":%s}",
+            o += sprintf(o, ",\"mesh\":{\"stage\":%d,\"threads\":%u,\"payload\":%u,\"maxv\":%u,\"maxp\":%u,\"topo\":%u,\"task\":%s%s}",
                          !strcmp(stage, "ts") ? 6 : 7, w58 & 0xffff, (w58 >> 24) * 256, w60 & 0xffff, w60 >> 16, w5c >> 24,
-                         (w5c >> 16 & 0xff) ? "true" : "false");
+                         (w5c >> 16 & 0xff) ? "true" : "false", host_mesh_fb ? ",\"fallback\":true" : "");
         }
         if (!strcmp(stage, "cs")) {
             // The compute binding table in the driver bank: texture entries (byte +0xb3), image entries (+0xb6), and
@@ -2463,6 +2477,7 @@ uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]) {
 }
 
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local, s->local, sizeof s->local); }
+const GfxMeshFallback *gfx_shader_mesh_fallback(const GfxShader *s) { return &s->mesh_fb; }
 
 // ---- answers met in play
 // The translated-shader key includes the answers a draw's state implies, so a translation made without play (the

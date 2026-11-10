@@ -57,8 +57,9 @@ void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys
 void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   // disk cache reads on the render
                                                      // thread (count, ns) and by the loaders (gfx_shader.c load_budget)
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs.
+// mesh_fallback: task and mesh programs are translated as compute shaders (GfxMeshFallback).
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
-                         int bda);
+                         int bda, int mesh_fallback);
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.
@@ -134,6 +135,21 @@ uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);
 uint32_t gfx_shader_omap(const GfxShader *s);   // FS: colour components it writes, 4 bits per target (SPH omap); 0 unknown
 uint32_t gfx_shader_mvprev_banks(const GfxShader *s);   // a last-frame variant: the banks (bit n: cn) its position reads   // Output Locations (VS varyings, FS colour targets)
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]);     // CS: the LocalSize execution mode; 1, 1, 1 otherwise
+// A task or mesh program translated for a GPU without mesh shaders (tools/xlate/MeshSpirv.cs ConvertFallback): a
+// compute shader that writes its output into the mesh fallback buffer. stage 0: not such a translation.
+typedef struct {
+    uint8_t stage;                   // 6 a task program, 7 a mesh program
+    uint8_t has_task;                // mesh: a task program launches its workgroups
+    uint8_t indices;                 // mesh: vertex indices per primitive (1 points, 2 lines, 3 triangles)
+    uint8_t point_size;              // mesh: a point size follows the vectors of each vertex
+    uint16_t threads;                // the workgroup's size; a task launches at most that many mesh workgroups
+    uint16_t max_vertices, max_primitives;
+    uint16_t stride_words;           // mesh: 32-bit words per vertex: the position, the vectors of `locations` in
+                                     // ascending order, then the point size padded to four words
+    uint32_t payload_words;          // the task payload each side copies, 0 without a task
+    uint32_t locations;              // mesh: bit g: generic vector g is written (the fragment shader's input Location g)
+} GfxMeshFallback;
+const GfxMeshFallback *gfx_shader_mesh_fallback(const GfxShader *s);
 
 // ---- back end (gfx_null.c, vk_*.c). Called by the NVN front end (nvn_api_*.c, nvn_ext.c) on guest threads.
 typedef struct {
