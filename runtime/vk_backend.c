@@ -131,7 +131,22 @@ void vk_present_drain(void) {
 // held and filled again at an eighth of the clock's rate: a pipeline that takes longer, or a run of them on a first
 // visit with nothing recorded, shows its incomplete frames as before and does not freeze the picture. Not with DLSS
 // Frame Generation, which is told about every frame.
-static struct { int64_t limit_ns, left_ns; uint64_t last_ns, held, runs, shown; int holding; } FH = {.limit_ns = -1};
+// The same hold covers a change of the scene's size (a DLSS or FSR 3.1 mode picked in the menu, vk_dlaa.c
+// vk_dlaa_resized_take): the first frames drawn into the game's new, empty scene targets come out dark or black, so the
+// previous picture stays for RESIZE_HOLD presents from the first frame of the new size. That is once per change of a
+// setting and does not use the allowance. It holds with DLSS Frame Generation too: a present left out is a longer gap
+// between two rendered frames to it (its constants and tags are set at the host present, gfx_present.c), and a dark
+// frame it is given comes out as several generated ones.
+// And it covers an area load (vk_exec_draw.c vk_exec_pool_loading): while the texture pool still makes the area's
+// textures, the frames show the ground and the walls as black stand-ins, so the picture before the load stays for up
+// to LOAD_HOLD_NS, also beside the allowance.
+#define RESIZE_HOLD 6
+#define LOAD_HOLD_NS 2000000000ull
+static struct {
+    int64_t limit_ns, left_ns;
+    uint64_t last_ns, held, runs, shown, load_t0, load_held;
+    int holding, resize_left;
+} FH = {.limit_ns = -1};
 
 static void frame_hold_refill(uint64_t now) {
     if (FH.limit_ns < 0) {
@@ -154,9 +169,30 @@ int vk_frame_hold_left(void) {
     return FH.left_ns > 0 && !vk_dlssg_active();
 }
 
-// 1: this frame is not shown. skipped: the draws it lacks.
-static int frame_hold(uint32_t skipped, uint64_t frame) {
+// 1: this frame is not shown. skipped: the draws it lacks; resized: its scene is the first of a new size.
+static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
     frame_hold_refill(kern_now_ns());
+    if (resized && FH.limit_ns > 0) {
+        FH.resize_left = RESIZE_HOLD;
+        rt_log("vk: frame %llu: the scene has a new size after a setting changed; the previous picture stays for %d "
+               "frames", (unsigned long long)frame, RESIZE_HOLD);
+    }
+    if (FH.resize_left) {   // beside the allowance: nothing below counts these frames
+        FH.resize_left--;
+        return 1;
+    }
+    if (FH.limit_ns > 0 && vk_exec_pool_loading()) {
+        uint64_t now = kern_now_ns();
+        if (!FH.load_t0) FH.load_t0 = now, FH.load_held = 0;
+        if (now - FH.load_t0 < LOAD_HOLD_NS) {
+            FH.load_held++;
+            return 1;
+        }
+    } else if (FH.load_t0) {
+        rt_log("vk: frame %llu: the previous picture stayed for %llu frames, %.0f ms, while an area's textures were made",
+               (unsigned long long)frame, (unsigned long long)FH.load_held, (double)(kern_now_ns() - FH.load_t0) / 1e6);
+        FH.load_t0 = 0;
+    }
     int hold = skipped && FH.left_ns > 0 && !vk_dlssg_active();
     if (hold && !FH.holding) FH.runs++;
     if (skipped && !hold) FH.shown++;
@@ -192,7 +228,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
-    int held = frame_hold(vk_exec_pending_draws_take(), frame);
+    int held = frame_hold(vk_exec_pending_draws_take(), vk_dlaa_resized_take(), frame);
     if (held || !img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         if (!held && plat_inc32(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
@@ -272,6 +308,12 @@ static int vk_be_exec_wait(uint64_t value, uint64_t timeout_ns) {
 // The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
 int gfx_replay_async(void) { return gfx_backend() == &gfx_vulkan_backend && vk_replay_async(); }
 
+// The front end's nvnEventSignal, before it writes (vk_exec_xfer.c "events the CPU signals").
+void gfx_event_signalling(const void *value, uint32_t to) {
+    vk_exec_event_cpu(value);
+    vk_exec_evt('c', value, to);
+}
+
 // The newest submit number (nvn_submit_count) whose replay is done: recording copies it used may be freed.
 uint64_t gfx_replayed_submits(void) {
     if (!gfx_replay_async()) return nvn_submit_count();
@@ -344,8 +386,13 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
     }
     vk_present_drain();
+    vk_exec_gate_wait(handles, n);   // a submission that begins with a wait for the CPU's signal: before its copies
     vk_texture_new_submit();
     uint64_t f = vk_sync_submit(handles, n);
+    // The submission stopped at a wait whose signal the CPU gave while it was being replayed (vk_exec_xfer.c "events
+    // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
+    // submission's value is the one the game's fence stands for.
+    if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
     if (PH.on && n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
         else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
@@ -492,6 +539,7 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     if (!gfx_replay_async()) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
         vk_dlssg_submitted(frame);
+        vk_exec_evt_frame(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
         if (present_held_on()) {   // present_held
