@@ -100,9 +100,27 @@ static void alt_stack(void) {
     sigaltstack(&ss, NULL);
 }
 
+// plat_cpu_reserve: the processor one thread holds for itself (-1 none) and the processors of all the others.
+static cpu_set_t reserve_rest;
+static int32_t reserve_cpu = -1;
+
+// A new thread inherits the affinity mask of the thread that starts it. One started by the thread that holds the
+// reserved processor would therefore run on that processor alone, and so would every thread it starts in turn: the
+// game's main thread reserves, so most guest threads, the audio and the movie decoder shared one processor. A thread
+// that starts with the reserved processor in its mask leaves it, for the others' processors when it had no other.
+static void leave_reserved_cpu(void) {
+    int cpu = __atomic_load_n(&reserve_cpu, __ATOMIC_ACQUIRE);
+    cpu_set_t set;
+    if (cpu < 0 || sched_getaffinity(0, sizeof set, &set) || !CPU_ISSET(cpu, &set)) return;
+    CPU_CLR(cpu, &set);
+    if (!CPU_COUNT(&set)) set = reserve_rest;
+    sched_setaffinity(0, sizeof set, &set);
+}
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
     alt_stack();
+    leave_reserved_cpu();   // before fn starts threads of its own
     __atomic_store_n(&t->tid, (int32_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
     if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
     t->fn(t->arg);
@@ -427,8 +445,10 @@ int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
 void plat_thread_detach(PlatThread *t) { pthread_detach(t->t); }
 
 // The calling thread gets the last processor of its affinity mask to itself: every other thread of the process now
-// running loses that processor (threads they start later inherit their masks), and the caller keeps only it. Returns
-// 1, or 0 when the mask has fewer than three processors or the caller's mask cannot be set.
+// running loses that processor (threads they start later inherit their masks), and the caller keeps only it. Threads
+// the caller starts later leave it as they start (leave_reserved_cpu); a thread a library starts from the caller's
+// thread, without plat_thread_new, still inherits the one processor. Returns 1, or 0 when the mask has fewer than
+// three processors or the caller's mask cannot be set.
 int plat_cpu_reserve(void) {
     cpu_set_t all, mine, rest;
     if (sched_getaffinity(0, sizeof all, &all) || CPU_COUNT(&all) < 3) return 0;
@@ -446,7 +466,10 @@ int plat_cpu_reserve(void) {
         if (tid > 0 && tid != me) sched_setaffinity(tid, sizeof rest, &rest);
     }
     if (d) closedir(d);
-    return sched_setaffinity(0, sizeof mine, &mine) == 0;
+    if (sched_setaffinity(0, sizeof mine, &mine)) return 0;
+    reserve_rest = rest;
+    __atomic_store_n(&reserve_cpu, last, __ATOMIC_RELEASE);
+    return 1;
 }
 
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
