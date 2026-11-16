@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <malloc.h>
 #include <linux/fs.h>
 #include <linux/futex.h>
 #include <linux/userfaultfd.h>
@@ -108,12 +109,17 @@ static void alt_stack(void) {
 static __thread cpu_set_t cpu_rest;
 static __thread int cpu_rest_set;
 
+static __thread char thread_name[16];   // plat_thread_name: copied at the start, as a detached thread's struct may go
+const char *plat_thread_name(void) { return thread_name[0] ? thread_name : NULL; }
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
+    memcpy(thread_name, t->name, sizeof thread_name);
     alt_stack();
     __atomic_store_n(&t->tid, (int32_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
     if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
     t->fn(t->arg);
+    plat_thread_end_run();   // what the other files keep per thread (platform.h plat_thread_end_hook)
     return NULL;
 }
 
@@ -328,6 +334,12 @@ int plat_intr_resume(PlatIntr *t, uint64_t to) {
     t->to = to;
     __atomic_store_n(&t->state, INTR_GO, __ATOMIC_RELEASE);
     return 1;
+}
+
+// Hardware data watchpoints are Windows' only (platform.h plat_watch_set): the diagnosis that uses them is off here.
+int plat_watch_set(const uint64_t *addr, const int *len, int n, PlatWatchHit hit) {
+    (void)addr, (void)len, (void)n, (void)hit;
+    return -1;
 }
 
 // ---- fibers: a stack switch of our own. glibc's swapcontext saves and restores the signal mask with a system call
@@ -1113,6 +1125,189 @@ static void ps_set(uint64_t addr, uint64_t n, uint8_t v) {
     if (addr < PS_LIMIT) memset(pstate + addr / PG, v, (size_t)((n + PG - 1) / PG));
 }
 
+// Guest memory as a memfd's (NX2NAVI_DMABUF, read from the environment: the reservations come before nx2navi.ini; on
+// by default where /dev/udmabuf opens, udmabuf's size limit is 1 GiB or more and NVIDIA's kernel module is not loaded;
+// 0 off, 1 on wherever it can be).
+// The watched reservations are MAP_SHARED mappings of one memfd, each at its own offset, so that /dev/udmabuf can make
+// a dma-buf of the game's own pages and the GPU driver import it (vk_memory.c "dma-buf imports"). A host-pointer
+// import is a userptr object to amdgpu, which the kernel looks up page by page again at every submission and
+// invalidates whenever the write watch or a freeze changes the pages' protection; a udmabuf pins the memfd's pages
+// once and never looks at the process's page tables, so protection changes leave the GPU's mapping alone. Everything
+// else stays as it was: the write watch, the freezes and the access faults work the same on a shared mapping.
+// Two things differ from private memory, and both are handled here under vm_lock:
+// - Decommitted pages must read zero when committed again. MADV_DONTNEED leaves a shared mapping's pages in the
+//   memfd, so a decommit punches them out of it (fallocate) instead. A page a dma-buf pins cannot go that way: the
+//   dma-buf would keep the old page while the CPU got a new one, and the GPU and the CPU would no longer see the same
+//   memory. Those pages are zeroed in place (gm_decommit).
+// - A dma-buf pins every page of its range, allocating the ones nothing has touched. When it is gone
+//   (plat_mem_dmabuf_done) the pages of its range that are not committed and that no other dma-buf pins are punched
+//   out, so they cost no memory.
+#if __has_include(<linux/udmabuf.h>)
+#include <linux/udmabuf.h>
+#else   // the kernel's ABI (include/uapi/linux/udmabuf.h), for headers older than it
+struct udmabuf_create { __u32 memfd; __u32 flags; __u64 offset; __u64 size; };
+#define UDMABUF_FLAGS_CLOEXEC 0x01
+#define UDMABUF_CREATE _IOW('u', 0x42, struct udmabuf_create)
+#endif
+#define GM_RES_MAX 4
+typedef struct { uint64_t addr, n, off; } GmRes;
+typedef struct { uint64_t lo, hi; } GmPin;
+static int gm_state;                   // vm_lock: 0 not decided, 1 the watched reservations are the memfd's, -1 not
+static int gm_fd = -1, gm_udev = -1;   // the memfd and /dev/udmabuf
+static uint64_t gm_size, gm_limit;     // bytes of the memfd handed out; udmabuf's size limit
+static GmRes gm_res[GM_RES_MAX];       // the shared reservations and their offsets in the memfd
+static int gm_nres;
+static GmPin *gm_pins;                 // vm_lock: the ranges live dma-bufs pin (one entry per dma-buf)
+static int gm_npins, gm_cpins;
+static char gm_note[200];              // why the reservations are not a memfd's ("" when NX2NAVI_DMABUF=0 or they are)
+
+// The largest dma-buf the udmabuf ioctl accepts, in bytes: the module's size_limit_mb parameter, or the module's
+// default of 64 MiB where the parameter cannot be read.
+static uint64_t udmabuf_limit(void) {
+    uint64_t mib;
+    if (!read_u64_file("/sys/module/udmabuf/parameters/size_limit_mb", &mib)) mib = 64;
+    return (mib < (1ull << 40) ? mib : 1ull << 40) << 20;
+}
+
+static void gm_open(void) {   // vm_lock held: the first watched reservation decides
+    const char *e = getenv("NX2NAVI_DMABUF");
+    int asked = e && !strcmp(e, "1");
+    gm_state = -1;
+    if (e && !strcmp(e, "0")) return;
+    // Unset: on where it can work and pays. NVIDIA's driver imports host pointers without amdgpu's costs (vk_memory.c
+    // mirror_mode), and its import of these dma-bufs has not been tried, so where its kernel module is loaded the memory
+    // stays private.
+    if (!asked && !access("/sys/module/nvidia", F_OK)) {
+        snprintf(gm_note, sizeof gm_note, "NVIDIA's kernel module is loaded (NX2NAVI_DMABUF=1 makes it a memfd's anyway)");
+        return;
+    }
+    gm_udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    if (gm_udev < 0) {   // many systems give the device to root and group kvm only
+        snprintf(gm_note, sizeof gm_note, "/dev/udmabuf cannot be opened (%s)", strerror(errno));
+        fprintf(stderr, "platform: guest memory as dma-bufs (NX2NAVI_DMABUF): %s: guest memory stays private\n", gm_note);
+        return;
+    }
+    gm_limit = udmabuf_limit();
+    // The game's largest pools need about 300 MiB in one dma-buf (vk_memory.c mirror_mode): below 1 GiB the back end
+    // would keep the shadow copies anyway, so unasked the memory stays private.
+    if (!asked && gm_limit < (1ull << 30)) {
+        snprintf(gm_note, sizeof gm_note, "udmabuf's size_limit_mb is %llu, below the 1024 a pool of the game may need "
+                 "(/sys/module/udmabuf/parameters/size_limit_mb)", (unsigned long long)(gm_limit >> 20));
+        close(gm_udev), gm_udev = -1;
+        return;
+    }
+    gm_fd = (int)syscall(SYS_memfd_create, "nx2navi-guest", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (gm_fd < 0) {
+        snprintf(gm_note, sizeof gm_note, "no memfd (%s)", strerror(errno));
+        fprintf(stderr, "platform: guest memory as dma-bufs (NX2NAVI_DMABUF): %s: guest memory stays private\n", gm_note);
+        close(gm_udev), gm_udev = -1;
+        return;
+    }
+    gm_state = 1;
+}
+
+static int gm_find(uint64_t addr, uint64_t n) {   // the shared reservation holding [addr, addr + n), -1 none
+    for (int i = 0; i < gm_nres; i++)
+        if (addr >= gm_res[i].addr && n <= gm_res[i].n && addr - gm_res[i].addr <= gm_res[i].n - n) return i;
+    return -1;
+}
+
+// vm_lock held. Whether x is pinned by a live dma-buf; *end gets the end of the run of [x, limit) that is the same.
+static int gm_pinned_run(uint64_t x, uint64_t limit, uint64_t *end) {
+    uint64_t cur = x;
+    for (int grew = 1; grew && cur < limit;) {
+        grew = 0;
+        for (int i = 0; i < gm_npins; i++)
+            if (gm_pins[i].lo <= cur && cur < gm_pins[i].hi) cur = gm_pins[i].hi, grew = 1;
+    }
+    if (cur > x) {
+        *end = cur < limit ? cur : limit;
+        return 1;
+    }
+    uint64_t next = limit;
+    for (int i = 0; i < gm_npins; i++)
+        if (gm_pins[i].lo > x && gm_pins[i].lo < next) next = gm_pins[i].lo;
+    *end = next;
+    return 0;
+}
+
+static int gm_punch(int gi, uint64_t addr, uint64_t n) {
+    return !fallocate(gm_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)(gm_res[gi].off + addr - gm_res[gi].addr),
+                      (off_t)n);
+}
+
+// vm_lock held: a decommit of [addr, addr + n) in shared reservation gi.
+static int gm_decommit(int gi, uint64_t addr, uint64_t n) {
+    uint64_t end = addr + n;
+    for (uint64_t x = addr, y; x < end; x = y) {
+        if (!gm_pinned_run(x, end, &y)) {
+            if (!gm_punch(gi, x, y - x)) return 0;
+            continue;
+        }
+        for (uint64_t a = x, b; a < y; a = b) {   // the committed runs; a reserved page is zero already
+            uint8_t v = pstate[a / PG];
+            for (b = a + PG; b < y && pstate[b / PG] == v; b += PG) {}
+            if (v < PS_NONE) continue;
+            if (v != PS_RW && mprotect((void *)(uintptr_t)a, b - a, PROT_READ | PROT_WRITE)) return 0;
+            memset((void *)(uintptr_t)a, 0, b - a);
+        }
+    }
+    if (mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
+    ps_set(addr, n, PS_RESERVED);
+    return 1;
+}
+
+int plat_mem_dmabuf_ok(uint64_t *limit, uint64_t *any, const char **why) {
+    plat_mutex_lock(&vm_lock);
+    int ok = gm_state > 0 && gm_nres > 0;
+    *limit = gm_limit;
+    *any = gm_nres ? gm_res[0].addr : 0;
+    *why = ok ? "" : gm_state > 0 ? "the memfd could not back a reservation" : gm_note;
+    plat_mutex_unlock(&vm_lock);
+    return ok;
+}
+
+int plat_mem_dmabuf(uint64_t addr, uint64_t n) {
+    if (!n || ((addr | n) & (PG - 1))) return -1;
+    plat_mutex_lock(&vm_lock);
+    int gi = gm_state > 0 && n <= gm_limit ? gm_find(addr, n) : -1, fd = -1, err = EINVAL;
+    if (gi >= 0 && gm_npins == gm_cpins) {
+        int c = gm_cpins ? gm_cpins * 2 : 64;
+        GmPin *p = realloc(gm_pins, (size_t)c * sizeof *p);
+        if (p) gm_pins = p, gm_cpins = c;
+    }
+    if (gi >= 0 && gm_npins < gm_cpins) {
+        struct udmabuf_create c = {.memfd = (__u32)gm_fd, .flags = UDMABUF_FLAGS_CLOEXEC,
+                                   .offset = gm_res[gi].off + addr - gm_res[gi].addr, .size = n};
+        fd = ioctl(gm_udev, UDMABUF_CREATE, &c);
+        err = errno;
+        if (fd >= 0) gm_pins[gm_npins++] = (GmPin){addr, addr + n};
+    }
+    plat_mutex_unlock(&vm_lock);
+    if (fd < 0) errno = err;
+    return fd;
+}
+
+void plat_mem_dmabuf_done(uint64_t addr, uint64_t n) {
+    plat_mutex_lock(&vm_lock);
+    for (int i = 0; i < gm_npins; i++)
+        if (gm_pins[i].lo == addr && gm_pins[i].hi == addr + n) {
+            gm_pins[i] = gm_pins[--gm_npins];
+            break;
+        }
+    int gi = gm_find(addr, n);
+    uint64_t end = addr + n;
+    for (uint64_t x = addr, y; gi >= 0 && x < end; x = y) {
+        if (gm_pinned_run(x, end, &y)) continue;
+        for (uint64_t a = x, b; a < y; a = b) {
+            uint8_t v = pstate[a / PG];
+            for (b = a + PG; b < y && pstate[b / PG] == v; b += PG) {}
+            if (v < PS_NONE) gm_punch(gi, a, b - a);
+        }
+    }
+    plat_mutex_unlock(&vm_lock);
+}
+
 static void ww_open(void) {
     int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
     struct uffdio_api api = {.api = UFFD_API,
@@ -1138,12 +1333,29 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
         pstate = p == MAP_FAILED ? NULL : p;
     }
     if (watch && ww_fd < 0 && pm_fd < 0) ww_open();
+    if (watch && !gm_state) gm_open();
+    int shared = watch && gm_state > 0 && gm_nres < GM_RES_MAX;
     void *p = pstate && addr + n <= PS_LIMIT
                   ? mmap((void *)(uintptr_t)addr, n, PROT_NONE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0)
+                         (shared ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS) | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+                         shared ? gm_fd : -1, shared ? (off_t)gm_size : 0)
                   : MAP_FAILED;
     int ok = p == (void *)(uintptr_t)addr;
     if (p != MAP_FAILED && !ok) munmap(p, n);   // a kernel without MAP_FIXED_NOREPLACE put it elsewhere
+    if (ok && shared) {   // the memfd grows by the reservation; shrinking is sealed off, as udmabuf requires
+        if (ftruncate(gm_fd, (off_t)(gm_size + n)) || (!gm_nres && fcntl(gm_fd, F_ADD_SEALS, F_SEAL_SHRINK))) {
+            fprintf(stderr, "platform: the memfd for %#llx+%#llx failed (%s): private memory there\n",
+                    (unsigned long long)addr, (unsigned long long)n, strerror(errno));
+            munmap(p, n);
+            p = mmap((void *)(uintptr_t)addr, n, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+            ok = p == (void *)(uintptr_t)addr;
+            if (p != MAP_FAILED && !ok) munmap(p, n);
+        } else {
+            gm_res[gm_nres++] = (GmRes){addr, n, gm_size};
+            gm_size += n;
+        }
+    }
     if (ok) {
         ps_set(addr, n, PS_RESERVED);
         // Transparent huge pages would populate (and count as written) 2 MiB at the first write of one page; writes are
@@ -1164,12 +1376,22 @@ void *plat_mem_alloc(size_t n) {
 }
 
 int plat_mem_commit(uint64_t addr, size_t n) {
-    if (mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE)) return 0;
-    ps_set(addr, n, PS_RW);
-    return 1;
+    // In a shared reservation under vm_lock: plat_mem_dmabuf_done punches out the pages it finds not committed.
+    int locked = gm_nres > 0 && gm_find(addr, n) >= 0;
+    if (locked) plat_mutex_lock(&vm_lock);
+    int ok = !mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE);
+    if (ok) ps_set(addr, n, PS_RW);
+    if (locked) plat_mutex_unlock(&vm_lock);
+    return ok;
 }
 
 int plat_mem_decommit(uint64_t addr, uint64_t n) {
+    if (gm_nres > 0) {
+        plat_mutex_lock(&vm_lock);
+        int gi = gm_find(addr, n), ok = gi >= 0 && gm_decommit(gi, addr, n);
+        plat_mutex_unlock(&vm_lock);
+        if (gi >= 0) return ok;
+    }
     if (madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED) || mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
     ps_set(addr, n, PS_RESERVED);
     return 1;
@@ -1294,6 +1516,7 @@ void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) {
 
 void plat_crash_context(const char *s) { (void)s; }   // the Windows crash notes only
 int plat_crash_filter_reassert(char *who, size_t n) { (void)who, (void)n; return 0; }   // Windows only
+const char *plat_crash_context_get(void) { return NULL; }
 
 // plat_jmp_save / plat_jmp_go (platform.h): leaf code that does not move rsp before it leaves, as on Windows.
 _Static_assert(sizeof(PlatJmp) == 72 && __builtin_offsetof(PlatJmp, mxcsr) == 64, "plat_jmp_save layout");
@@ -1672,11 +1895,27 @@ int plat_stderr_path(char *out, size_t cap) {
     return 1;
 }
 
+int plat_stderr_write(const void *p, size_t n) {
+    for (const char *c = p; n;) {
+        ssize_t k = write(2, c, n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return 0;
+        c += k, n -= (size_t)k;
+    }
+    return 1;
+}
+
+int plat_console_setup(void (*on_close)(const char *what)) {   // a Windows console's settings only
+    (void)on_close;
+    return 0;
+}
+
 // ---- process
 
 #ifdef NX2NAVI_PGO_GEN
-// compiler-rt's profile runtime (an instrumented build, tools/build_game.py --pgo gen). It writes its counters from an
-// atexit handler, which _exit skips; __llvm_profile_dump writes them once and makes later writes no-ops.
+// compiler-rt's profile runtime (an instrumented build: --pgo gen of tools/make_game.py or tools/build_game.py). It
+// writes its counters from an atexit handler, which _exit skips; __llvm_profile_dump writes them once and makes later
+// writes no-ops.
 int __llvm_profile_dump(void);
 #endif
 
@@ -1691,6 +1930,15 @@ void plat_exit(int code) {
     fflush(stderr);
     _exit(code);
 }
+
+void plat_terminate(int code) { _exit(code); }
+
+// The note of an end the game did not ask for is the Windows executable's TLS callback (win32.c); nothing here.
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n)) { (void)log, (void)queued; }
+void plat_exit_note_modules(void) {}
+void plat_exit_orderly(void) {}
+
+void plat_stack_guarantee(void) {}   // the crash report runs on the signal stack crash handling sets up
 
 int plat_setenv(const char *name, const char *value) {
     return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;
@@ -2013,6 +2261,67 @@ void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     fclose(f);
 }
 
+uint32_t plat_handle_count(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return 0;
+    uint32_t n = 0;
+    for (struct dirent *e; (e = readdir(d));) n += e->d_name[0] != '.';
+    closedir(d);
+    return n ? n - 1 : 0;   // less the descriptor of this walk
+}
+
+// plat_handle_census: each descriptor's link, by kind: "socket:[N]" and "pipe:[N]" by their prefix, an anonymous
+// inode by its kind ("anon_inode:[eventfd]" is eventfd), a device by its /dev folder, any other path as file.
+int plat_handle_census(PlatHandleKind *out, int max) {
+    DIR *d = max > 0 ? opendir("/proc/self/fd") : NULL;
+    if (!d) return -1;
+    int n = 0, self = dirfd(d);
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.' || atoi(e->d_name) == self) continue;
+        char link[64], target[256], kind[32];
+        snprintf(link, sizeof link, "/proc/self/fd/%s", e->d_name);
+        ssize_t len = readlink(link, target, sizeof target - 1);
+        if (len < 0) continue;   // closed meanwhile
+        target[len] = 0;
+        if (!strncmp(target, "/dev/", 5)) {
+            size_t k = strcspn(target + 5, "/");
+            snprintf(kind, sizeof kind, "/dev/%.*s", (int)(k < 20 ? k : 20), target + 5);
+        } else if (target[0] == '/') {
+            snprintf(kind, sizeof kind, "%s", "file");
+        } else if (!strncmp(target, "anon_inode:", 11)) {
+            const char *k = target + 11 + (target[11] == '[');
+            snprintf(kind, sizeof kind, "%.*s", (int)strcspn(k, "]"), k);
+        } else {
+            snprintf(kind, sizeof kind, "%.*s", (int)strcspn(target, ":"), target);
+        }
+        int i = 0;
+        while (i < n && strcmp(out[i].name, kind)) i++;
+        if (i == n) {
+            if (n == max) {   // no room: the last entry takes the rest
+                i = max - 1;
+                snprintf(out[i].name, sizeof out[i].name, "%s", "(more kinds)");
+            } else {
+                snprintf(out[n].name, sizeof out[n].name, "%s", kind);
+                out[n++].n = 0;
+            }
+        }
+        out[i].n++;
+    }
+    closedir(d);
+    return n;
+}
+
+// glibc's mallinfo2 (2.33 and later) sums every arena: arena is what the arenas took with brk and mmap, hblkhd the
+// blocks mmapped one by one, uordblks what the arenas handed out. Other C libraries leave the figures unknown.
+void plat_heap_info(PlatHeapInfo *h) {
+    memset(h, 0, sizeof *h);
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    struct mallinfo2 m = mallinfo2();
+    h->committed = (uint64_t)m.arena + m.hblkhd;
+    h->used = (uint64_t)m.uordblks + m.hblkhd;
+#endif
+}
+
 // ---- memory limits
 //
 // Linux overcommits, so memory that runs short does not fail an allocation: the OOM killer ends the process, when it
@@ -2298,13 +2607,14 @@ void plat_child_lower(PlatChild *c) {   // a higher nice value needs no privileg
 // A child that died makes the write fail with EPIPE; SIGPIPE is ignored for the process (main.c), as Windows has none.
 int plat_child_write(PlatChild *c, const void *data, size_t n) { return write_all(c->in, data, n); }
 
-// See win32.c plat_child_read: a child that never answers fails the read after PLAT_CHILD_READ_MS.
+// See win32.c plat_child_read: a child that never answers fails the read with -2 after PLAT_CHILD_READ_MS.
 long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     struct pollfd pf = {.fd = c->out, .events = POLLIN};
     int r;
     do r = poll(&pf, 1, PLAT_CHILD_READ_MS);
     while (r < 0 && errno == EINTR);
-    if (r <= 0) return -1;   // timed out or failed
+    if (!r) return -2;      // timed out
+    if (r < 0) return -1;   // failed
     ssize_t k;
     do k = read(c->out, buf, cap);
     while (k < 0 && errno == EINTR);
@@ -2366,7 +2676,7 @@ void plat_ipc_close(PlatIpc *p) {
     free(p);
 }
 
-// ---- UDP sockets (platform.h): the co-op layer's transport
+// ---- UDP sockets (platform.h)
 struct PlatUdp { int fd, v6; };
 
 static void addr_from_sockaddr(PlatAddr *out, const struct sockaddr_storage *ss) {

@@ -1,8 +1,16 @@
-<p align="center"><img src="docs/images/navi.png" alt="NX2navi" width="160"></p>
+<p align="center"><a href="https://triforceproject.com"><img src="https://git.triforceproject.com/triforce/source/raw/branch/main/assets/triforce.png" alt="Triforce" width="200"></a></p>
 
 # NX2navi
 
-**Join the official NX2navi update discord server: https://discord.com/invite/uf6gSrsPpq** 
+> [!IMPORTANT]
+> **NX2navi is no longer the current project. NX2navi and Triforce have merged and go on as Triforce.**
+> Get Triforce from https://triforceproject.com. Its source is at https://git.triforceproject.com/triforce/source.
+>
+> This repository and its releases are kept as they are. Release 0.12.0 turns an installed NX2navi launcher into a
+> window that starts Triforce Setup; **Play NX2navi** there still starts the game you have built, and your game, saves
+> and settings stay where they are. Triforce's Convert saves page brings your NX2navi saves over.
+
+**Join the official Triforce update discord server: https://discord.com/invite/uf6gSrsPpq** 
 
 **NX2navi** is a static recompilation of *The Legend of Zelda: Ocarina of Time* for Nintendo Switch 2 (game
 version 1.1.1) into a native x86-64 application for Windows, with a Vulkan renderer
@@ -16,7 +24,10 @@ version 1.1.1) into a native x86-64 application for Windows, with a Vulkan rende
 
 ## Status
 
-Early development, playable. Kokiri Forest, Kakariko Village, Death Mountain Trail and its crater, the Temple of
+New work goes into Triforce, not here (see the top of this page). What follows describes NX2navi as it was at the
+handover.
+
+Playable. Kokiri Forest, Kakariko Village, Death Mountain Trail and its crater, the Temple of
 Time and the Great Fairy fountains play at 60 fps and above on current GPUs, from the title screen and from saves.
 Visual bugs and occasional crashes are still expected ([Known issues](#known-issues)).
 
@@ -38,8 +49,11 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
   display; in a window of another shape than the picture, frames are generated inside the picture only, so the black
   bars stay clean. The frame limit counts the frames the game draws, and frame generation adds its
   frames on top of it. The frame limit can also be
-  handed to RivaTuner Statistics Server
-- HDR on HDR displays, two kinds: the game's scene tone mapped to the display's peak, matched to the game's mid grey and tone, with true blacks, or the game's own native HDR; peak, game and HUD brightness in the menu
+  handed to RivaTuner Statistics Server, which then limits the game in its place once it is seen holding the game;
+  the game paces movies itself, and takes the limit back while it is minimised and whenever RivaTuner is not seen
+  holding it; where frame generation or low latency keeps it out, the game says when a limit set in RivaTuner itself
+  holds the game as well
+- HDR on HDR displays, two kinds: the game's scene tone mapped to the display's peak, matched to the game's mid grey and tone, with true blacks, or the game's own native HDR; peak, game and HUD brightness in the menu, and for the tone mapped picture the tone mapper, gamma correction, exposure, highlights, shadows, contrast and saturation
 - The game's known shaders prepared when the game is built, and the pipelines met in play built again in the
   background at each start, so play rarely stops to compile them; a shader or pipeline met for the first time can
   still hold a frame, and a draw that must wait for its pipeline has it built on worker threads, never on the game's
@@ -59,6 +73,10 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
   video memory and 48 GiB of RAM, as Windows counts video memory against the system's commit limit
 
 ## Installing
+
+New here: get Triforce from https://triforceproject.com instead. Release 0.12.0 carries no setup, and a launcher
+installed from an earlier release updates itself into the window that starts Triforce Setup. The rest of this section
+describes NX2navi's own setup before 0.12.0.
 
 Download `NX2navi-Setup-<version>.exe` from the releases and start it next to your `.nup` dump. It is the only file
 you need. The launcher it

@@ -17,7 +17,14 @@ typedef struct PlatThread PlatThread;
 typedef void (*PlatThreadFn)(void *arg);
 
 // Starts fn(arg) on a new thread named name (shown in debuggers and profilers; may be NULL). NULL on failure.
+// Keeps PLAT_STACK_GUARANTEE bytes of the calling thread's (or fiber's) stack for its own stack overflow: the crash
+// report then runs on them. The threads and fibers made here get it at their start; main calls it for its thread.
+#define PLAT_STACK_GUARANTEE 32768
+void plat_stack_guarantee(void);
 PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name);
+// The name the calling thread was made with here (plat_thread_new, plat_thread_spawn), NULL for a thread made
+// elsewhere; kept in the thread itself, so the crash report can read it with any lock held.
+const char *plat_thread_name(void);
 // The same with the stack size given: stack bytes reserved for the thread (0: PLAT_STACK_DEFAULT). The default is the
 // same on every OS, so a thread that fits on Windows fits elsewhere.
 #define PLAT_STACK_DEFAULT (16u << 20)
@@ -28,6 +35,11 @@ void plat_thread_join(PlatThread *t);     // waits for fn to return, then frees 
 // Waits at most ns for fn to return: 1 when it did (t is freed), 0 when it still runs (t stays valid).
 int plat_thread_join_ns(PlatThread *t, uint64_t ns);
 void plat_thread_detach(PlatThread *t);   // frees t; the thread runs on
+// fn runs on every thread these calls make, when its function has returned and before the thread ends: for what a
+// thread keeps for itself alone (a decoder context). At most PLAT_THREAD_END_HOOKS, each added once.
+#define PLAT_THREAD_END_HOOKS 4
+void plat_thread_end_hook(void (*fn)(void));
+void plat_thread_end_run(void);            // the platform files' thread start functions call it
 // Restricts t (NULL: the calling thread) to the logical processors in mask (bit n = processor n of the first group).
 // Returns the previous mask, 0 on failure.
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask);
@@ -69,6 +81,16 @@ int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp);
 // Lets a stopped t go on: at to when to is nonzero, else where it stopped. 0 when the redirection failed (t then goes
 // on where it stopped).
 int plat_intr_resume(PlatIntr *t, uint64_t to);
+
+// Hardware data watchpoints (diagnosis: floor_watch.c). Up to four addresses, each watched for any read or write of its
+// len bytes (1, 2, 4 or 8, the address aligned to it), on every thread the process has when they are set; threads
+// started later have none. After each access hit(slot, frames, depth) runs on the thread that made it, inside its
+// exception handling: frames[0] is the instruction after the access, then up to PLAT_WATCH_DEPTH - 1 return addresses.
+// hit must not lock, allocate or log, and its nonzero return clears that thread's watchpoints. n = 0 clears them on
+// every thread. Returns the threads changed; -1 where the platform has none (Linux) or the change failed.
+#define PLAT_WATCH_DEPTH 4
+typedef int (*PlatWatchHit)(int slot, const uint64_t *frames, int depth);
+int plat_watch_set(const uint64_t *addr, const int *len, int n, PlatWatchHit hit);
 
 // Fibers: execution contexts with stacks of their own that threads switch between; a fiber may resume on another
 // thread. Each switch keeps the callee-saved registers and the floating-point control state.
@@ -258,6 +280,17 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // pages in one call, where the watch works by protecting pages (Linux), so the stores do not fault page by page. The
 // pages count as written. Returns 0 when there is nothing to clear or it cannot be done; the write is valid either way.
 int plat_mem_prepare_write(uint64_t addr, uint64_t n);
+// Guest memory as dma-bufs (Linux, NX2NAVI_DMABUF, on by default; vk_memory.c "dma-buf imports"): the watched
+// reservations are shared mappings of one memfd, and /dev/udmabuf makes a dma-buf of a page range of it, which the GPU
+// driver imports like its own memory. plat_mem_dmabuf_ok: 1 when that is so, with udmabuf's size limit in bytes in *limit and the
+// first page of a shared reservation in *any; 0 with the reason in *why ("" when NX2NAVI_DMABUF=0 turned it off).
+// plat_mem_dmabuf: a new dma-buf file descriptor over [addr, addr + n) (whole pages inside one watched reservation),
+// -1 with errno on failure. Its pages stay pinned (a decommit zeroes them in place) until plat_mem_dmabuf_done is
+// told, after the last user of the dma-buf (the imported memory) is gone; the pages of its range that nothing has
+// committed then go back to the system. Elsewhere these report 0 and -1.
+int plat_mem_dmabuf_ok(uint64_t *limit, uint64_t *any, const char **why);
+int plat_mem_dmabuf(uint64_t addr, uint64_t n);
+void plat_mem_dmabuf_done(uint64_t addr, uint64_t n);
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
@@ -296,6 +329,7 @@ void plat_crash_context(const char *s);
 // Puts the crash hook's last-chance exception filter back in place. 1 when a DLL loaded later had set its own in its
 // place (who: that filter's module and offset), 0 when it was still there. Windows only; 0 elsewhere.
 int plat_crash_filter_reassert(char *who, size_t n);
+const char *plat_crash_context_get(void);   // the calling thread's note, for the crash report (NULL: none)
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure
@@ -304,6 +338,10 @@ void plat_aligned_free(void *p);
 // ---- process
 _Noreturn void plat_exit(int code);       // ends the process at once: other threads stop, no atexit handlers run
 extern void (*plat_exit_hook)(void);      // called first by plat_exit when set (main.c: the queued log lines)
+// Ends the process at once with code, and nothing else: no exit hook, no stream flush, and no library's detach call
+// (ExitProcess and _Exit run every one). For the ends of a failed run (dispatch.c fatal_end, vk_device.c
+// lost_wait_exit), which have written their lines themselves and must not wait on a lock another thread holds.
+_Noreturn void plat_terminate(int code);
 int plat_setenv(const char *name, const char *value);    // value NULL removes it; 1 on success
 uint32_t plat_process_id(void);
 // CPU time of the process since it started (user and kernel), and wall time since it started, in ns; 0 when unknown.
@@ -365,6 +403,16 @@ int plat_file_private(const char *path);                  // only this account m
 typedef struct PlatAppend PlatAppend;
 PlatAppend *plat_append_open(const char *path);           // creates or truncates path; NULL on failure
 int plat_append_write(PlatAppend *f, const void *data, size_t n);   // 1 when all n bytes landed
+// An end the game did not ask for: ExitProcess (or exit()) called by a library, or by the runtime outside plat_exit and
+// plat_terminate. Windows calls the executable's TLS callback for it, with every other thread already stopped, and the
+// callback then writes what the log queue held (queued(&p, &n): the bytes as they stand, no lock) and one line with
+// the return addresses that led to the end into log. Nothing for plat_exit, plat_terminate, TerminateProcess from
+// outside, or after plat_exit_orderly (main returning from a tool mode). plat_exit_note_modules notes the loaded
+// modules, whose names the line gives the addresses (the callback may not ask the loader): at start and at a focus
+// loss. Windows only; elsewhere they do nothing.
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n));
+void plat_exit_note_modules(void);
+void plat_exit_orderly(void);
 // Calls cb(name, ctx) for each file in dir whose name ends in ext (".in"); name has no directory part. cb returns 0 to
 // stop. Returns 0 when dir cannot be listed.
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx);
@@ -445,8 +493,20 @@ int plat_os_version(char *out, size_t cap);
 int plat_is_wine(void);                                   // 1 when the Windows build runs under Wine; 0 elsewhere
 // The file the process's stderr (the log) goes to, as a UTF-8 path; 0 when stderr is not a file (a console, a pipe).
 int plat_stderr_path(char *out, size_t cap);
+// Writes the bytes to stderr's file descriptor, past the C runtime's FILE stream (on Windows with its low-level _write,
+// which keeps the text mode's line ends): a write that blocks, on a console that holds its output back, then holds no
+// lock of the stderr stream, and fflush(stderr) or fflush(NULL) on another thread does not wait for it. 1 when all of
+// them were written.
+int plat_stderr_write(const void *p, size_t n);
+// When stderr is a console window (Windows): turns its QuickEdit mode off, since a selection made in the window with
+// the mouse holds back every write to it until the selection ends, and passes a close of the console, Ctrl+C and
+// Ctrl+Break to on_close, on a thread of the system's, with the event's name. on_close must end the process: Windows
+// ends it about 5 s after a close in any case. A second Ctrl+C or Ctrl+Break while on_close runs ends the process at
+// once, as without the handler. plat_exit puts QuickEdit back as it was. 1 when stderr is a console; elsewhere 0, and
+// nothing is changed.
+int plat_console_setup(void (*on_close)(const char *what));
 
-// ---- desktop: the in-game menu's "Copy system info", "Open log folder" and the Co-op tab's secret
+// ---- desktop: the in-game menu's "Copy system info" and "Open log folder"
 int plat_clipboard_set(const char *utf8);                 // replaces the clipboard's text; 1 on success
 // The clipboard's text as UTF-8 in out (cap bytes with the NUL; a longer text: "" on Windows, cut at a character
 // elsewhere); 1 when it had text. With SDL only on the window thread, as SDL asks: the menu goes through
@@ -497,6 +557,22 @@ int plat_page_file_managed(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
+// The handles (Windows) or file descriptors (Linux) this process holds; 0 when unknown.
+uint32_t plat_handle_count(void);
+// The same by kind: Windows the object type of each handle (Event, Section, Thread, File...), Linux what each file
+// descriptor's link names (socket, pipe, an anon_inode kind, a /dev folder, file). Fills out with up to max kinds,
+// unsorted, and returns how many, -1 on failure; the kinds past max are counted in the last entry, named "(more
+// kinds)". Never opens, duplicates or names a handle. Windows reads the system's whole handle table into a buffer of a
+// few MiB kept between calls: one thread calls it at a time.
+typedef struct { char name[32]; uint32_t n; } PlatHandleKind;
+int plat_handle_census(PlatHandleKind *out, int max);
+// The C runtime's malloc heap in bytes, for the memory report (vk_memory.c system_log): what it took from the system
+// (committed) and what of that it handed out (used), and how many other heaps the process has (Windows: those DLLs made
+// with HeapCreate, the graphics driver's among them; their sizes are not asked, as a heap made without serialization
+// cannot be read while its owner uses it). 0 when unknown. Holds the heap's lock while it adds up, so it is called at
+// report time only. Windows: HeapSummary of the heap malloc uses; Linux: glibc's mallinfo2 over every arena.
+typedef struct { uint64_t committed, used; uint32_t other_heaps; } PlatHeapInfo;
+void plat_heap_info(PlatHeapInfo *h);
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;
@@ -508,8 +584,12 @@ void plat_child_stop(PlatChild *c);                       // kills the child and
 // that must not slow the game down (gfx_shader.c, the carry pass).
 void plat_child_lower(PlatChild *c);
 int plat_child_write(PlatChild *c, const void *data, size_t n);   // 1 when all n bytes were written
+#ifndef PLAT_CHILD_READ_MS                                 // a check may build the child functions with a shorter one
 #define PLAT_CHILD_READ_MS 120000   // plat_child_read gives up on a child that sends nothing for this long
-long plat_child_read(PlatChild *c, void *buf, size_t cap);        // bytes read (at least 1); 0 or negative: pipe broke or timed out
+#endif
+// Bytes read (at least 1); 0 or -1 when the pipe broke (the child is gone); -2 when nothing came for PLAT_CHILD_READ_MS
+// while the child kept its end open (a child stuck on its input: asking it again would wait as long).
+long plat_child_read(PlatChild *c, void *buf, size_t cap);
 
 // ---- local IPC: a stream connection to another program of this machine, one listen location per name (Discord's
 // Rich Presence, discord_rpc.c). On Windows the named pipe \\.\pipe\<name>; on Linux the Unix domain socket
@@ -522,7 +602,7 @@ int plat_ipc_read(PlatIpc *p, void *buf, size_t n, uint32_t ms);
 int plat_ipc_write(PlatIpc *p, const void *buf, size_t n);   // 1 when all n bytes were written, 0 the connection broke
 void plat_ipc_close(PlatIpc *p);
 
-// ---- UDP sockets: the co-op layer's transport (coop.c). One unconnected datagram socket per PlatUdp; who a datagram
+// ---- UDP sockets. One unconnected datagram socket per PlatUdp; who a datagram
 // came from is checked by the protocol, not by the OS. On Windows the first call of any of these starts Winsock.
 // A PlatAddr is an IPv6 address (an IPv4 one as ::ffff:a.b.c.d), the port and the scope id in the same layout on every
 // OS, so two equal addresses compare equal bytewise (plat_addr_eq) whichever way the OS reported them.

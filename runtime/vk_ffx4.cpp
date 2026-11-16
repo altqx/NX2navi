@@ -24,13 +24,18 @@ extern "C" {
 extern "C" int vk_ffx4_available(void) { return 0; }
 extern "C" const char *vk_ffx4_name(void) { return "AMD FSR 4"; }
 extern "C" int vk_ffx4_upscale(VkCommandBuffer, const VkFfxImage *, const VkFfxImage *, const VkFfxImage *, const VkFfxImage *,
-                               float, float, int, float, float) {
+                               float, float, int, float, const VkFfxCamera *) {
     return 0;
 }
 extern "C" void vk_ffx4_release(void) {}
+extern "C" int vk_ffx4_holds(void) { return 0; }
 extern "C" int vk_ffx4_failed(void) { return 0; }
 extern "C" void vk_ffx4_retry(void) {}
 extern "C" void vk_ffx4_trim(uint64_t) {}
+extern "C" uint64_t vk_ffx4_vram(int *contexts) { return *contexts = 0, 0; }
+extern "C" void vk_ffx4_release_idle(void) {}
+extern "C" int vk_ffx4_dead_take(uint64_t) { return 0; }
+extern "C" uint64_t vk_ffx4_dead_fence(void) { return 0; }
 #else
 #include <windows.h>
 #include <atomic>
@@ -43,12 +48,14 @@ extern "C" void vk_ffx4_trim(uint64_t) {}
 
 #include "third_party/ffx_sdk/upscalers/include/ffx_upscale.h"
 #include "vk_ffx4_api.h"
+#include "vk_up_defer.h"
 
 extern "C" {
 #include "cfg.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "vk.h"
+#include "vk_exec.h"
 #include "vk_ffx.h"
 }
 
@@ -178,30 +185,64 @@ int probe(void) {
     return 1;
 }
 
-// One context per output size, made for render sizes up to the output's, as vk_ffx.cpp keeps them for FSR 3.1: every
-// render scale of the menu runs on it with its own render size at each dispatch, which the API allows up to the
-// context's maxRenderSize. With one context per render and output size, each mode tried made a context of its own,
-// about 217 MiB of video memory and 50 to 70 ms each, up to six were kept beside FSR 3.1's, and three creations that
-// failed (the card out of memory) turned FSR 4 off for the run. The descriptors a context was made from stay with it,
-// as the API asks ("must remain live until ffxDestroyContext").
+// One context per render size and output size, kept as vk_ffx.cpp keeps FSR 3.1's (see there): a new render size
+// makes a context of its own (50 to 70 ms and up to about 217 MiB of video memory) and the one before goes a few frames
+// later, so a mode change costs a creation; with the game's dynamic resolution on one context with
+// FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION takes every step. Contexts kept for every mode tried, as once, piled up to six
+// beside FSR 3.1's and three creations that failed (the card out of memory) turned FSR 4 off for the run; one context
+// for every render size, as next, preceded an access violation in AMD's driver inside the dispatch after a switch from
+// 67 % to 100 %. The descriptors a context was made from stay with it, as the API asks ("must remain live until
+// ffxDestroyContext"): in a Made of its own on the heap, so that a context let go of (retire_up) keeps them until it is
+// destroyed, once the GPU is past its last upscale (g_dead), while its slot already holds the next one.
+struct Made {
+    ffxCreateContextDescUpscale desc;
+    ffxCreateBackendVKDesc backend;
+    ffxOverrideVersion version;
+    ffxCreateContextDescUpscaleVersion built;
+};
 struct Up {
     ffxContext ctx = nullptr;
-    uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the largest render size it takes; the output size
+    uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the render size it was made for (the largest it takes with drs); the output size
+    bool drs = false;                          // made for dynamic resolution (FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION)
     uint64_t used = 0, used_ns = 0;            // up_tick and the time when context_for last returned it
-    ffxCreateContextDescUpscale desc = {};
-    ffxCreateBackendVKDesc backend = {};
-    ffxOverrideVersion version = {};
-    ffxCreateContextDescUpscaleVersion built = {};
+    Made *made = nullptr;                      // the descriptors it was made from (calloc), freed after its destroy
+    uint64_t vram = 0;                         // its video memory as the library reported it at its creation
+    uint64_t fence = 0;                        // the submission of its last upscale (vk_exec_recording_fence), 0 none
 } U[4];
 uint64_t up_tick;
-const uint64_t UP_RECENT = 8;   // contexts used this recently may sit in a command buffer not submitted yet
+// Contexts used this recently stay (as vk_ffx.cpp's UP_RECENT): the policy only, as one that goes waits for the GPU
+// through its fence.
+const uint64_t UP_RECENT = 8;
 // A context no upscale used for this long goes (vk_ffx4_trim): FSR 4's after a switch to FSR 3.1, and a second scene's
-// (the pause screen's) a while after it closed. Unused that long, no command buffer names it.
+// (the pause screen's) a while after it closed.
 const uint64_t UP_IDLE_NS = 90ull * 1000000000ull;
 
-void destroy_up(Up *u, const char *why) {
-    rt_log("ffx4: the %ux%u context (render sizes up to %ux%u) destroyed: %s", u->ow, u->oh, u->mw, u->mh, why);
-    A.destroy(&u->ctx, nullptr);
+// The contexts let go of, destroyed once the GPU is past their last upscale (vk_ffx4_dead_take): handle the context,
+// aux its Made. Only the thread that makes the upscales (vk_dlaa.c's pass hooks) touches it; vk_ffx4_release at
+// teardown.
+UpdList g_dead;
+const int DEAD_CTX4 = 4;   // its one kind
+
+void dead_release(const UpdEntry *e, void *) {
+    uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: "upscaler releases"
+    ffxContext c = (ffxContext)e->handle;
+    A.destroy(&c, nullptr);
+    free(e->aux);
+    perf_mark_end(PERF_M_UPREL, t0, 0);
+}
+
+void retire_up(Up *u, const char *why) {
+    rt_log("ffx4: the %ux%u context (render sizes up to %ux%u) let go of (destroyed once the GPU is past its last "
+           "upscale): %s", u->ow, u->oh, u->mw, u->mh, why);
+    if (!upd_put(&g_dead, DEAD_CTX4, u->ctx, u->made, u->fence, 0)) {
+        // full, which the GPU's progress does not let happen: room after a wait for the device, or else all of them go
+        // as before this list, the device idle
+        vk_upscaler_settle();
+        if (!upd_put(&g_dead, DEAD_CTX4, u->ctx, u->made, u->fence, 0)) {
+            upd_take_all(&g_dead, dead_release, nullptr);
+            upd_put(&g_dead, DEAD_CTX4, u->ctx, u->made, u->fence, 0);
+        }
+    }
     *u = Up();
 }
 
@@ -218,33 +259,43 @@ FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
 }
 
 // A context in slot for render sizes up to mw x mh and the output size ow x oh; NULL when it is not made.
-Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh) {
+Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh, bool drs) {
     const VkCtx *c = vk_ctx();
     *slot = Up();
-    slot->built.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
-    slot->built.version = FFX_UPSCALER_VERSION;
-    slot->version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-    slot->version.header.pNext = &slot->built.header;
-    slot->version.versionId = g_version;
-    slot->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-    slot->backend.header.pNext = &slot->version.header;
-    slot->backend.deviceContext = {c->device, c->phys, vkGetDeviceProcAddr};
-    slot->desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    slot->desc.header.pNext = &slot->backend.header;
-    slot->desc.flags =
-        FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INFINITE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
-    slot->desc.maxRenderSize = {mw, mh};
-    slot->desc.maxUpscaleSize = {ow, oh};
-    slot->desc.fpMessage = message;
+    Made *m = (Made *)calloc(1, sizeof *m);   // zeroed, as the descriptors' {} were
+    if (!m) {
+        rt_log("ffx4: no memory for the descriptors of a %s context", g_name);
+        return nullptr;
+    }
+    m->built.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+    m->built.version = FFX_UPSCALER_VERSION;
+    m->version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    m->version.header.pNext = &m->built.header;
+    m->version.versionId = g_version;
+    m->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    m->backend.header.pNext = &m->version.header;
+    m->backend.deviceContext = {c->device, c->phys, vkGetDeviceProcAddr};
+    m->desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    m->desc.header.pNext = &m->backend.header;
+    m->desc.flags =
+        FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;   // a finite far plane, as FSR 3.1's
+    // NX2NAVI_FFX_DEBUG=1 (test): the library checks the values of each dispatch and says what it finds (message)
+    if (rt_knob("FFX_DEBUG", "0")) m->desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+    if (drs) m->desc.flags |= FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+    m->desc.maxRenderSize = {mw, mh};
+    m->desc.maxUpscaleSize = {ow, oh};
+    m->desc.fpMessage = message;
     uint64_t t0 = plat_now_ns();
-    ffxReturnCode_t r = A.create(&slot->ctx, &slot->desc.header, nullptr);
+    ffxReturnCode_t r = A.create(&slot->ctx, &m->desc.header, nullptr);
     if (r != FFX_API_RETURN_OK || !slot->ctx) {
         rt_log("ffx4: %s context creation for %ux%u (render sizes up to %ux%u) failed (%u)", g_name, ow, oh, mw, mh,
                (unsigned)r);
+        free(m);
         *slot = Up();
         return nullptr;
     }
-    slot->mw = mw, slot->mh = mh, slot->ow = ow, slot->oh = oh;
+    slot->made = m;
+    slot->mw = mw, slot->mh = mh, slot->ow = ow, slot->oh = oh, slot->drs = drs;
     ffxQueryGetProviderVersion v = {};
     v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     A.query(&slot->ctx, &v.header);
@@ -253,35 +304,43 @@ Up *create(Up *slot, uint32_t mw, uint32_t mh, uint32_t ow, uint32_t oh) {
     mq.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
     mq.gpuMemoryUsageUpscaler = &mem;
     A.query(&slot->ctx, &mq.header);
+    slot->vram = mem.totalUsageInBytes;
     rt_log("ffx4: FSR %s upscaling to %ux%u from render sizes up to %ux%u, made in %.0f ms, %.0f MiB of video memory",
            v.versionName ? v.versionName : "4", ow, oh, mw, mh, (double)(plat_now_ns() - t0) / 1e6,
            (double)mem.totalUsageInBytes / 1048576.0);
     // The provider is asked for the version it runs: anything but a 4.x here means the loader gave another upscaler
     if (v.versionName && atoi(v.versionName) < 4) {
         rt_log("ffx4: the context runs FSR %s, not FSR 4: FSR 4 off", v.versionName);
-        A.destroy(&slot->ctx, nullptr);
+        A.destroy(&slot->ctx, nullptr);   // never used by the GPU
+        free(m);
         *slot = Up();
         return nullptr;
     }
     return slot;
 }
 
-// The context for a render size and an output size: the one of that output size that takes the render size, else a
-// new one, in a free slot or in place of the least recently used one, with the device idle first. A creation that
-// fails is tried once more after every context not in use has gone, FSR 3.1's idle ones too (vk_ffx_trim_idle): what
-// it lacked was most often video memory.
+// The context for a render size and an output size: the one made for them, else a new one, in a free slot or in place
+// of the least recently used one; the others of that output size go once they are not recent. What goes is let go of
+// and destroyed once the GPU is past it (retire_up). A creation that fails is tried once more after every context not
+// in use has gone, FSR 3.1's idle ones too (vk_ffx_trim_idle), and the GPU has finished with them and with those let go
+// of before: what it lacked was most often video memory.
 Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     up_tick++;
     uint64_t now = plat_now_ns();
-    Up *small = nullptr;   // a context of this output size made for smaller render sizes
+    const bool drs = cfg_bool("NX2NAVI_DYN_RES");
+    Up *found = nullptr;
     for (Up &u : U)
-        if (u.ctx && u.ow == ow && u.oh == oh) {
-            if (w <= u.mw && h <= u.mh) {
-                u.used = up_tick, u.used_ns = now;
-                return &u;
-            }
-            small = &u;
-        }
+        if (u.ctx && u.ow == ow && u.oh == oh && u.drs == drs && (drs ? w <= u.mw && h <= u.mh : w == u.mw && h == u.mh))
+            found = &u;
+    int gone = 0;
+    for (Up &u : U)   // the contexts of this output size for another render size, once they are not recent
+        if (u.ctx && &u != found && u.ow == ow && u.oh == oh && up_tick - u.used >= UP_RECENT)
+            retire_up(&u, "the render size changed"), gone++;   // their work may be in flight
+    if (gone) vk_upscaler_let_go();
+    if (found) {
+        found->used = up_tick, found->used_ns = now;
+        return found;
+    }
     Up *slot = nullptr, *lru = nullptr;
     for (Up &u : U) {
         if (!u.ctx) {
@@ -290,24 +349,24 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         }
         if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
     }
-    if (small && up_tick - small->used >= UP_RECENT) slot = nullptr, lru = small;   // a larger one takes its place
-    const VkCtx *c = vk_ctx();
     if (!slot && lru) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
-        destroy_up(lru, lru == small ? "a larger render size came" : "its slot went to another output size");
+        retire_up(lru, "its slot went to another output size");   // its work may still be in flight
+        vk_upscaler_let_go();
         slot = lru;
     }
     if (!slot) return nullptr;
-    // the render size up to the output size: every mode of the menu, and a scene drawn at the output size itself
-    uint32_t mw = w > ow ? w : ow, mh = h > oh ? h : oh;
-    Up *u = create(slot, mw, mh, ow, oh);
+    // the render size itself; for dynamic resolution, every size up to the output's (and a scene at the output size)
+    uint32_t mw = !drs ? w : w > ow ? w : ow, mh = !drs ? h : h > oh ? h : oh;
+    Up *u = create(slot, mw, mh, ow, oh, drs);
     if (!u) {
         int freed = 0;
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
         for (Up &o : U)
-            if (o.ctx && up_tick - o.used >= UP_RECENT) destroy_up(&o, "room for a context whose creation failed"), freed++;
+            if (o.ctx && up_tick - o.used >= UP_RECENT) retire_up(&o, "room for a context whose creation failed"), freed++;
         freed += vk_ffx_trim_idle(UP_RECENT);
-        if (freed) u = create(slot, mw, mh, ow, oh);
+        // the creation needs their memory now: a wait for the GPU to pass them all, this file's and FSR 3.1's (with
+        // NX2NAVI_UPSCALER_IDLE_WAIT=1 for the device, as before), and they go
+        const int dead = vk_ffx_dead_take(vk_upscaler_gpu_wait(vk_ffx_dead_fence()));
+        if (freed || dead) u = create(slot, mw, mh, ow, oh, drs);
     }
     if (u) u->used = up_tick, u->used_ns = now;
     return u;
@@ -350,11 +409,11 @@ extern "C" void vk_ffx4_retry(void) {
 // Called at every upscale, with FSR 4 or FSR 3.1 (vk_ffx.cpp vk_ffx_upscale), on the thread that records them.
 extern "C" void vk_ffx4_trim(uint64_t now_ns) {
     for (Up &u : U)
-        if (u.ctx && now_ns - u.used_ns > UP_IDLE_NS) destroy_up(&u, "no upscale used it for 90 s");
+        if (u.ctx && now_ns - u.used_ns > UP_IDLE_NS) retire_up(&u, "no upscale used it for 90 s");
 }
 
 extern "C" int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
-                               const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y) {
+                               const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, const VkFfxCamera *cam) {
     if (!vk_ffx4_available() || g_off.load(std::memory_order_acquire)) return 0;
     uint64_t now = plat_now_ns();
     if (g_failures && now < g_retry_ns) return 0;   // FSR 3.1 serves until the next try
@@ -382,11 +441,13 @@ extern "C" int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, cons
     d.frameTimeDelta = dt_ms;
     d.preExposure = 1.0f;
     d.reset = reset != 0;
-    d.cameraNear = 0.1f;   // Ocarina's projection (vk_dlaa.c ocam_vp): near 0.1, far at infinity
-    d.cameraFar = 1e8f;
-    d.cameraFovAngleVertical = fov_y > 0 ? fov_y : 1.0f;
-    d.viewSpaceToMetersFactor = 0.01f;   // the game's units are centimetres
+    // the frame's camera (vk_dlaa.c proj_planes), as FSR 3.1 gets it (vk_ffx.cpp)
+    d.cameraNear = cam && cam->znear > 0 ? cam->znear : 0.1f;
+    d.cameraFar = cam && cam->zfar > 0 ? cam->zfar : 1e8f;
+    d.cameraFovAngleVertical = cam && cam->fov_y > 0 ? cam->fov_y : 1.0f;
+    d.viewSpaceToMetersFactor = cam && cam->meters > 0 ? cam->meters : 1.0f;
     ffxReturnCode_t r = A.dispatch(&u->ctx, &d.header);
+    u->fence = vk_exec_recording_fence();   // recorded into cb (a refusal too, for all this side knows)
     if (r != FFX_API_RETURN_OK) {
         static int told;
         if (told++ < 8) rt_log("ffx4: %s dispatch failed (%u)", g_name, (unsigned)r);
@@ -422,9 +483,39 @@ extern "C" ffxReturnCode_t vk_ffx4_api_dispatch(ffxContext *ctx, const ffxDispat
     return A.dispatch ? A.dispatch(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 
+extern "C" int vk_ffx4_holds(void) {
+    for (Up &u : U)
+        if (u.ctx) return 1;
+    return 0;
+}
+
+// Teardown and the probe: the device is idle.
 extern "C" void vk_ffx4_release(void) {
     if (!A.destroy) return;
     for (Up &u : U)
-        if (u.ctx) A.destroy(&u.ctx, nullptr), u = Up();
+        if (u.ctx) A.destroy(&u.ctx, nullptr), free(u.made), u = Up();
+    upd_take_all(&g_dead, dead_release, nullptr);
+}
+
+// The upscaler is off (vk_ffx.cpp vk_ffx_release_idle): every context is let go of.
+extern "C" void vk_ffx4_release_idle(void) {
+    for (Up &u : U)
+        if (u.ctx) retire_up(&u, "the upscaler is off");
+}
+
+extern "C" int vk_ffx4_dead_take(uint64_t done) {
+    return g_dead.n ? upd_take(&g_dead, done, UINT64_MAX, dead_release, nullptr) : 0;
+}
+
+extern "C" uint64_t vk_ffx4_dead_fence(void) { return upd_max_fence(&g_dead); }
+
+// FSR 4's upscaling contexts that exist and their video memory, for the memory report (vk_ffx.cpp vk_ffx_vram).
+extern "C" uint64_t vk_ffx4_vram(int *contexts) {
+    uint64_t bytes = 0;
+    int n = 0;
+    for (Up &u : U)
+        if (__atomic_load_n(&u.ctx, __ATOMIC_RELAXED)) n++, bytes += __atomic_load_n(&u.vram, __ATOMIC_RELAXED);
+    *contexts = n;
+    return bytes;
 }
 #endif   // _WIN32

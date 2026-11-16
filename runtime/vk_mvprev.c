@@ -25,6 +25,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "vk_dlaa.h"
@@ -80,7 +81,7 @@ int vk_mvprev_on(void) { return P.on > 0; }
 void vk_mvprev_want(uint32_t index_mask) {
     static int fixed = -1;
     if (fixed < 0) fixed = !rt_knob("MVPREV_GROW", "1");   // NX2NAVI_MVPREV_GROW=0: c5, c7 and c14 only (test)
-    if (!fixed) P.mask |= index_mask & ((1u << BANKS) - 1);
+    if (!fixed) __atomic_fetch_or(&P.mask, index_mask & ((1u << BANKS) - 1), __ATOMIC_RELAXED);   // chunks at once
 }
 
 uint64_t vk_mvprev_step(int stage, int index, uint64_t size) {
@@ -131,9 +132,19 @@ void vk_mvprev_draw(VkExec *ex) {
     P.ns_draw += kern_now_ns() - t0;
 }
 
+static void mvprev_draw_locked(VkExec *ex);
+static PlatMutex draw_lock = PLAT_MUTEX_INIT;   // the replay workers' scene draws note blocks at once
+
 static void mvprev_draw_(VkExec *ex) {
     const VkExecTarget *z = &ex->depth;
     if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
+    int lk = vk_exec_shared();   // only while a parallel group (vk_exec.c) records do several threads note at once
+    if (lk) plat_mutex_lock(&draw_lock);
+    mvprev_draw_locked(ex);
+    if (lk) plat_mutex_unlock(&draw_lock);
+}
+
+static void mvprev_draw_locked(VkExec *ex) {
     int check = P.bytes[0] != NULL;   // NX2NAVI_MVPREV_CHECK=1: the summary's checks (3.6 ms a frame)
     for (int index = 0; index < BANKS; index++) {
         if (!(P.mask >> index & 1)) continue;
@@ -172,8 +183,9 @@ static void mvprev_draw_(VkExec *ex) {
 }
 
 void vk_mvprev_frame(void) {
-    // without DLSS (no NGX, no RTX GPU, dlaa = 0) nothing reads last frame's blocks: P.on stays 0, no tables
-    if (!vk_dlaa_available()) return;
+    // without DLSS (no NGX, no RTX GPU, dlaa = 0) and without frame generation alone (vk_dlaa_fg_only) nothing reads
+    // last frame's blocks: P.on stays 0, no tables
+    if (!vk_dlaa_available() && !vk_dlaa_fg_only()) return;
     if (P.knob < 0) {
         P.knob = rt_knob("DLAA_OBJMV", "1");
         if (P.knob) {
@@ -186,7 +198,7 @@ void vk_mvprev_frame(void) {
             P.timed = rt_knob("MVOBJ_TIMES", "0");
         }
     }
-    int on = P.knob && cfg_bool("NX2NAVI_DLAA");
+    int on = P.knob && (cfg_bool("NX2NAVI_DLAA") || vk_dlaa_fg_only());
     if (on != (P.on > 0)) {
         P.on = on ? 1 : -1;
         if (P.t[0]) memset(P.t[0], 0, TABLE * sizeof(Seen)), memset(P.t[1], 0, TABLE * sizeof(Seen));

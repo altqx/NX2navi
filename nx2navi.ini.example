@@ -1,7 +1,11 @@
 # nx2navi.ini: settings for nx2navi.exe. Copy this file to nx2navi.ini next to nx2navi.exe and remove the '#' of a line to change it.
 # Each line shows the default; on a Steam Deck the device profile ([display]) changes a few of them. A NX2NAVI_*
 # environment variable of the same name (NX2NAVI_FPS_LIMIT for fps_limit) overrides the file. Keys are case-insensitive;
-# '#' and ';' start a comment; [sections] only group lines.
+# '#' and ';' start a comment; [sections] only group lines. After the value of a setting with a list of choices or a
+# range, a space or tab then '#' or ';' starts a comment too ("fps_limit = 144 # my monitor" is 144); a path, a name, a
+# size, a keyboard key and the settings that take any number (gpu_index, compute_keep, tex_released_max, floor_probe,
+# floor_scan) keep their whole text. A setting whose only values are 0 and 1 also takes off, false and no for 0 and on,
+# true and yes for 1; a setting with more choices than 0 and 1 takes only the choices its lines here list.
 # Only the keys in this file are settings. A line with any other key does nothing: the game's log names it at the
 # start ("no setting of this version") and the settings menu (F1) shows it in its bottom row.
 # Updates and rebuilds of the game never rewrite nx2navi.ini; the settings menu changes only the lines of the settings
@@ -24,10 +28,17 @@
 # game draws the monitor's rate divided by the multiplier.
 # fps_limit = 60
 # Where RivaTuner Statistics Server is installed and running, the limit goes into its profile for the game's
-# executable and RTSS does the limiting instead of the game; closing the game puts back what the profile held.
-# Changing that profile needs the game run as administrator (RTSS keeps its profiles under Program Files); without
-# it, or with frame generation on, the game limits by itself, and also when RTSS's own frame counter shows the game
-# well past the limit (RTSS then hooks the game without holding it back). rtss = 0 always leaves it to the game.
+# executable and RTSS does the limiting instead of the game, once RTSS is seen holding the game to it; closing the game
+# puts back what the profile held, and after a crash or a kill the next start does, unless it has rtss = 0
+# (rtss-profile.txt next to the game keeps what it held). Changing that profile needs the game run as administrator
+# (RTSS keeps its profiles under Program Files). Without it the game limits by itself, as it does with frame generation
+# on (RTSS would count the generated frames), while the window is minimised, and for the rest of the run when RTSS's
+# own frame counter shows the game past the limit (RTSS then hooks the game without holding it back) or RTSS is not
+# seen holding the game within 30 s; the game paces movies itself. With low latency on, the driver holds the limit.
+# rtss = 0 always leaves it to the game. With rtss = 0,
+# frame generation or low latency, a limit set in RTSS itself (its global profile or the game's, a frame time limit or
+# scanline sync) limits the game a second time: the log and the settings menu say so, and setting it to 0 in RTSS
+# leaves one limiter.
 # rtss = 1
 # 1: asks RTSS's EnumProfiles whether the game's profile exists, instead of looking for its file. EnumProfiles crashes
 # the game (RTSS keeps a pointer of the game's in 32 bits); only for testing an RTSS that fixed it.
@@ -42,12 +53,36 @@
 # highfps_fix = 1
 # Above 60 fps the game's physics solved contacts and friction in fewer steps a second than at 60, and in none at all
 # in a frame shorter than 1/240 s, so things standing on moving platforms were left behind. 1 rounds the step count
-# up instead; 0 is the game's own count.
+# up instead; 0 is the game's own count. 2 also gives every frame at least the 4 steps of a 60 fps frame, which costs
+# more physics time above 60 fps (576 steps a second at 144 fps, 960 at 240, against about 288 and 240 with 1) and is
+# a candidate fix for Link left behind on the Deku Tree's floating platform. Read at start.
 # physics_steps = 1
 # The number in the window that shows a pick-up (a rupee) counts up by whole steps a frame, and above 60 fps the game
 # rounded that step down to nothing: the window stayed until the area was left and its counting sound went on. 1 lets
 # it count at least one a frame; 0 is the game's own count.
 # pickup_count = 1
+# Water surfaces and the springy floors (the Deku Tree's webs) are simulated in fixed steps of 1/60 s, as many as the
+# frame's time holds, and the game dropped the rest: above 60 fps every frame ran none, so they stood still under Link.
+# 1 keeps the rest for the next frame, 60 steps a second at any frame rate; 0 is the game's own count. Read at start.
+# water_steps = 1
+# Above 60 fps the game handed its sound system a fraction of a frame each frame, which was reported to keep sounds
+# held after an area unloaded until new sounds and then the music went silent. 1 runs the sound system 60 times a
+# second with whole frames while the frame rate is above 60; 0 is the game's own step. Read at start.
+# sound_steps = 1
+# Above 100 fps the game kept only a tenth of a moving floor's speed for whoever stood on it, so Link was left behind
+# on moving platforms (the Deku Tree's floating one). 1 makes the floor carry him as at 60 fps at any frame rate; 0 is
+# the game's own cut. Read at start; needs game code generated with this release.
+# floor_carry = 1
+# The ocarina's recorder counts how long each note and rest lasts in 60 Hz frames, and the game cut each frame's step
+# to a whole number: above 60 fps that was 0, so a recorded performance lost its rests and the recorder's time limits
+# never came, and at the 40 and 45 fps limits it counted slow. 1 keeps the fraction for the next frame, 60 a second at
+# any frame rate; 0 is the game's own count. Read at start; needs game code generated with this release.
+# ocarina_timing = 1
+# A movie's narration and fades follow the picture on screen: 1 counts their time from the shown picture's
+# timestamp, so they stay with it at any frame rate (with movie_fps = 0 too) and wait when the picture stalls; 0 counts
+# the game's redraws, as before, which keeps them with the music when the picture stalls. Read at start; needs game
+# code generated with this release.
+# movie_pts = 1
 # The step the game is given each frame: 1 keeps it steady (the same value from frame to frame while the frame rate
 # holds, exactly one 60 Hz frame at a 60 fps limit) and makes up for a late frame over the next second; 0 is the mean
 # of the last five frame times, which changes with every frame.
@@ -66,6 +101,34 @@
 # of latency, and can show a dark or flickering frame now and then: the other thread reads vertex and buffer memory
 # the game has sometimes rewritten by then.
 # replay_async = 0
+# EXPERIMENTAL. Record the large groups of draws of a submission on this many replay worker threads beside the
+# submitting one: auto or 0 to 16. Default: auto, half the CPU's physical cores less one (2 on 6 cores, 3 on 8, 5 on
+# 12, at most 6), none on four cores or fewer and none on AMD's driver for RX 6000 and older Radeon cards, where a
+# player's game lost its graphics device with workers on; the log's "replay workers automatic" line says how many.
+# 0: the replay records everything on one thread. 3 gave 51.7 instead of 43.6 fps standing in Hyrule Field on an RX
+# 7900 XT, and more than 3 gave nothing more there. Also in the menu: Game, Testing, CPU helper threads.
+# With 1 a worker records each long run of draws while the submitting thread waits for it: no faster, it checks that
+# the pictures stay the same.
+# replay_workers = auto
+# 1, the default, lets the game start on its next frame while the graphics card still runs the end of the last one: the
+# upscaler (FSR 4, FSR 3.1 or DLSS) and the interface drawn after it. The graphics card runs the same work, with the
+# copies of what it wrote for the game moved before that end, and the game's waits end once those copies and the
+# results it reads are there. A frame whose end hands the game anything else runs as before. Default: 1 (0 up to
+# 0.9.2); 0 turns it off. Standing in Hyrule Field on an RX 7900 XT with FSR 4: 50.7 instead of 42.5 fps, and 63.5
+# instead of 49.4 with replay_workers = 3.
+# Does nothing without one of those upscalers, nor with the lazy write-back (the default on NVIDIA and Intel cards).
+# Also in the menu: Game, Testing, Start next frame early.
+# tail_early = 1
+# EXPERIMENTAL, with replay_workers. replay_pipe = N (0 to 4, default 0): the submitting thread goes on past up to N
+# groups its workers still record. replay_small = N (0 to 63, default 0, needs replay_pipe): a group of N draws or more
+# that is too small to share out (fewer than 64 draws) goes whole to one worker; 64 or more reads as 63. Kokiri Forest
+# standing on an RX 7900 XT with FSR 4, tail_early = 1, replay_workers = 5, replay_pipe = 4 and replay_small = 16: 63
+# instead of 45 fps with all of them off. On an RTX 3090 a tester measured the same three settings against the
+# defaults at eight places: slower at four (50.1 instead of 58.1 fps at one) and level or up to 7 % faster at the
+# other four. So both stay off unless you turn them on. Also in the menu: Game, Testing, Helpers work ahead
+# (replay_pipe) and Helpers take small jobs (replay_small). Neither does anything without replay workers.
+# replay_pipe = 0
+# replay_small = 0
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
 # usually at start. Keep 0 to play.
@@ -73,30 +136,62 @@
 # Windows timer resolution of 1 ms for steadier frame pacing (0 = the Windows default).
 # timer_1ms = 1
 # The thread that records the GPU work (the first to spend half a second doing it, not the one that submits first) keeps
-# the highest scheduling priority (recorder_prio), and a core of its own that the process's other threads stay off
-# (recorder_core: auto = with 12 or more logical processors, 1 always, 0 never). That is a fast core, with both of its
-# logical processors: on Windows the highest-numbered core of the fastest efficiency class; on Linux the performance
-# core that clocks highest on a hybrid CPU (else the core of the highest capacity or clock), and none when fewer than
-# four cores are that fast. The log names the thread and its logical processors.
+# the highest scheduling priority (recorder_prio), and can get a core of its own that the process's other threads stay
+# off (recorder_core: 0 = never, the default; auto = with 12 or more logical processors, unless the game runs on the
+# cache die below; 1 always). That is a fast core, with both of its logical processors: on Windows the highest-numbered
+# core of the fastest efficiency class; on Linux the performance core that clocks highest on a hybrid CPU (else the core
+# of the highest capacity or clock), and none when fewer than four cores are that fast. The log names the thread and
+# its logical processors. Default 0: on an i9-14900KF the reserved core left the woken replay thread unscheduled for
+# about 200 ms roughly once a second.
 # recorder_prio = 1
-# recorder_core = auto
+# recorder_core = 0
 # Submissions handed to the GPU queue together in one call, 1 to 16 (1 = each one at once).
 # submit_batch = 4
+# Mesa's Vulkan drivers (RADV, ANV, NVK): every submission to the GPU queue goes to a thread of the queue's own, so its
+# kernel call leaves the thread that prepares the frames, 0 or 1. Default: on (Linux), off (Windows). 0 leaves the
+# driver's own choice. Unused when MESA_VK_ENABLE_SUBMIT_THREAD is set.
+# submit_thread = 1
 # Occlusion query results are read back from the video card in batches, 0 or 1. Default: on. 0 reads each query with a
 # call of its own, as before, which on AMD's Windows driver held every frame's "GPU done" back by about 4 ms.
 # oq_batch = 1
+# The game clears small ranges of its buffers on the video card. Where such a range holds a counter the video card
+# also reports into (a timestamp or an occlusion count), the clear and the reports reach the game's memory in the
+# order the game issued them, 0 or 1. Default: on. 0 leaves the clear to the video card alone, as before, and a
+# report issued before the clear can then be written after it.
+# clear_small_cpu = 1
+# Occlusion counts the replay could not take, 0 or 1. Default: off. When the GPU or the thread that reads the results
+# falls behind (a hitch at a high frame rate), some draws find no free occlusion query and go uncounted, and the
+# game's report after them says only what the rest counted, at least 1: the object it tested looks all but hidden for
+# that frame, and whatever the game scales by that count drops for one frame. 1 makes such a report repeat the last
+# full count of the same object (or what was counted, if that is more). The log says how often it happens either way
+# ("samples-passed reports so far missed draws", at the 1st, 10th, 100th...). Read at start.
+# oq_hold = 0
+# Indexed quads and line loops, 0 or 1. Default: off. Vulkan has no quad or line-loop topology: draws without indices
+# are rewritten already, and 1 does the same for indexed ones (two triangles per quad, a closing line for a loop), which
+# otherwise are drawn with the game's indices as triangles and an open line, joining corners of neighbouring quads.
+# The log names the first such draw either way ("an indexed quad list"); without that line the game has drawn none.
+# Read at start.
+# quad_index = 0
+# EXPERIMENT, 0 or 1. Default: off. The game asks the video card how much of an object would show behind what is
+# already drawn (an occlusion query) and leaves hidden objects out. With 1 it asks nothing and draws them all: more
+# draws in a frame, and no queries to issue or results to wait for and read back. Whether that gains or loses frames
+# has not been measured, and it differs from place to place. The log's "patches:" line at the start says
+# "occlusion_off on" when the game was built with the patch set and the setting took effect.
+# patch_occlusion_off = 0
 # How many milliseconds a submit call waits for the game's own signal that the frame's data is written, when the
 # frame's commands begin with a wait for that signal (0 to 100; 0: the frame is set aside at once and drawn at its
 # present, as before).
 # gate_wait_ms = 10
 # Dynamic resolution, 0 or 1, applied at once: with a DLSS upscaling mode, the scene resolution follows the GPU time
-# per frame toward dyn_res_target milliseconds (1 to 100), one DLSS step at a time, each held for dyn_res_step frames
-# (8 to 600), from the DLSS mode set down to performance. Default: off.
+# per frame toward dyn_res_target milliseconds (1 to 100; 0 is the time of a frame the game draws under fps_limit,
+# 1000 / the limit, and 16.7 with fps_limit = unlimited), one DLSS step at a time, each held for dyn_res_step 60ths of
+# a second (8 to 600; 45 is 0.75 s at any frame rate), from the DLSS mode set down to performance. Default: off.
 # dyn_res = 0
-# dyn_res_target = 16.7
+# dyn_res_target = 0
 # dyn_res_step = 45
 # Processors. On a processor whose dies have L3 caches of different sizes (AMD's two-die X3D processors, with 3D
-# V-Cache on one die) the game runs on the die with the larger cache: 1 = on, 0 = Windows places the threads.
+# V-Cache on one die) the game runs on the die with the larger cache when that die has 8 cores or more: 1 = on,
+# 0 = Windows places the threads.
 # cache_die = 1
 # One logical processor of each physical core, so no two busy threads share a core: 1 = on, 0 = all of them.
 # one_per_core = 0
@@ -119,6 +214,10 @@
 # How many milliseconds the draws of one frame may wait, in all, for a missing pipeline to be linked from the shader
 # libraries in the graphics driver's cache before they are dropped (0 to 100; 0: dropped at once, as before).
 # pipe_link_ms = 6
+# How many milliseconds one missing pipeline is waited for, counted from the first draw that needed it (1 to 50).
+# With its shader libraries in the driver's cache a pipeline takes 2 to 8 ms; what is not ready by then is left out
+# of the frames until it is. A longer wait leaves fewer draws out and makes those frames longer.
+# pipe_link_draw_ms = 3
 # When a draw finds its pipeline missing, the rest of the commands the game submitted with it are read ahead and the
 # shader libraries of every other pipeline they will need are built at once on background threads, so the later draws
 # find theirs ready instead of waiting one after another or being left out of a frame. 0: off, as before.
@@ -141,6 +240,11 @@
 # of a new area take to build.
 # oneshot_budget = 1
 # oneshot_wait_ms = 30000
+# A draw whose shaders also write memory (a storage buffer, or an image they store into) waits for its pipeline in
+# the same way, also when it draws into a picture the game draws every frame: left out of a frame, it would be drawn
+# again the next frame, but what it was to write would be missing for everything that reads it until then. 0: such a
+# draw is left out like any other while its pipeline is built.
+# draw_writers_wait = 1
 # Build shader stage libraries in the background ahead of time, and the threads for it (1 to 16; default 2). More
 # threads mostly wait on the graphics driver's lock: 16 on NVIDIA spent about 8 cores spinning in the driver.
 # lib_prebuild = 1
@@ -172,8 +276,12 @@
 # build_reserve_mb = 64
 # 1: the log says how many pipelines came from pipeline-cache.bin; 2 also logs every compute pipeline built. 0: off.
 # pipe_feedback = 1
-# pipeline-cache.bin larger than this (MB) starts empty and is rewritten (0: no limit).
-# pipeline_cache_max_mb = 512
+# The limit of pipeline-cache.bin and of pipeline-cache-play.bin, each, in MB (0: no limit). A file larger than
+# this starts empty, so the game never writes one past it: once a cache reaches the limit, pipelines compiled after
+# that are compiled again at the next start. With the pipeline list of 0.9.1 and later a full cache is about 550 MB
+# on an NVIDIA card, so the limit has to stay well above that. Default: your RAM / 32, between 1024 and 4096 (2048
+# with 64 GB).
+# pipeline_cache_max_mb = 2048
 # 1: the pipelines a run compiles go into pipeline-cache-play.bin, a small file of its own, so pipeline-cache.bin
 # (hundreds of MB) is not written again while you play; the small file is folded into the large one at a start once
 # it has grown. 0: one file, written whole whenever a run made a new pipeline.
@@ -192,9 +300,29 @@
 # pipe_binaries_max_mb = 1024
 # Build known pipelines ahead of time.
 # pipe_prebuild = 1
-# 1: the start waits until every known pipeline is built. Default 0: with the graphics pipeline library the start
-# builds them for at most 20 seconds and the rest in the background while you play.
-# prewarm_full = 0
+# Count the shared pipeline list that comes with the release (seed-pipeline-keys.bin) as known pipelines, so a new
+# install builds them at the start instead of at their first draw. 0: only the pipelines this install drew.
+# pipe_seed = 1
+# Whether the start builds the pipelines of that list which this install has never drawn. They take 2 to 4 GB of
+# memory (commit) on an NVIDIA card and about 1.5 GB on an AMD one for the whole run, drawn or not.
+# auto (default): built at the start, except on a PC that starts with less memory free than the game takes in play
+#   (the start's "this machine has ... MB of memory left for the game" warning): there each is made at its first
+#   draw, from the pipeline cache, and built at the start from then on.
+# 1: always built at the start. 0: never; a first visit to an area can then hold a frame for a moment.
+# pipe_seed_boot = auto
+# How long the start waits for known pipelines on the "Preparing shaders" screen.
+# auto (default): with the graphics pipeline library the start builds them for at most 20 seconds and the rest in the
+#   background while you play. The first start after a graphics driver update (or with another GPU) waits for
+#   everything instead, because nothing is built then and the game would crawl while it all compiles beside it: every
+#   known pipeline, the compute pipelines and the driver's own shader cache. That takes minutes, once per driver; a
+#   start closed during it goes on with it the next time (three starts at most).
+# 1: every start waits until every known pipeline is built.
+# 0: never more than the 20 seconds, also after a driver update.
+# prewarm_full = auto
+# The most seconds that first start after a driver update waits (0: no limit). When they are up the game starts and
+# the rest is built in the background while you play, as on any other start. Closing the window while it waits is
+# safe: the next start goes on with it.
+# prewarm_full_s = 600
 # Threads that translate known shaders at start (1 to 64; default: half the CPU threads, at most 16).
 # prewarm_xlate = 8
 # After an update that brings a new shader translator, 1 keeps using the shader cache's translations from the earlier
@@ -203,11 +331,22 @@
 # the new translator cannot translate keeps its old translation. 0: shaders the new translator has not translated yet
 # are translated before they are used (at start or when the game first draws them), as earlier versions did.
 # shader_carry = 1
+# 1 keeps a shader's translation (its SPIR-V) compressed in memory once no pipeline was made of it for
+# shader_compress_idle_s seconds (1 to 3600), and decompresses it when one is made again (about 0.06 ms for most
+# shaders): about 570 MiB less memory with 7,000 shaders in memory, the picture unchanged. 0 keeps every translation
+# as it is.
+# shader_compress = 1
+# shader_compress_idle_s = 30
 # Vulkan graphics pipeline library, 0 or 1. Default: on, except with AMD's Windows driver for RX 6000 and older cards
 # (RX 400 to RX 6000), where the game ended at every enemy killed with it on. There it is off: a pipeline needed for
 # the first time is built whole while its draw is left out for some frames, and the start waits until every pipeline
 # of earlier sessions is built. gpl = 1 turns it on again.
 # gpl = 1
+# The pipelines of the foliage, the grass and the terrain (mesh shaders) are linked from shader libraries like the
+# others, where the graphics pipeline library is on: foliage of a kind seen for the first time is drawn after a short
+# link, and its optimised pipeline is built behind it. 0: as before, each such pipeline is built whole (0.2 to 1.1 s)
+# while its foliage waits or is left out of the picture. The log's line "mesh pipelines are ..." says which is in use.
+# gpl_mesh = 1
 
 # Textures and memory.
 # ASTC texture decoding: native (the GPU's own ASTC support), gpu (a compute shader), cpu, or auto (native when the GPU
@@ -242,11 +381,14 @@
 # texture (0 = the CPU untiles the blocks first).
 # astc_gpu_deswizzle = 1
 # With astc = gpu: 1 keeps the decoder's scratch buffer from one upload batch to the next instead of making it again for
-# each, to shorten the hitches when an area loads (0 = one per batch; off until a play test measures it).
-# astc_scratch_keep = 0
+# each, to shorten the hitches when an area loads (0 = one per batch).
+# astc_scratch_keep = 1
+# With astc_scratch_keep = 1: 1 gives back a scratch grown for a large texture 5 s after the last one needed it (up to
+# 192 MiB of video memory after an area load); 0 keeps it until the next ASTC upload, as in 0.10.1.
+# astc_scratch_trim = 1
 # With astc = gpu: 1 stages a texture's ASTC blocks in the shared staging ranges instead of a buffer of their own
-# (0 = a buffer each; off until a play test measures it).
-# astc_arena = 0
+# (0 = a buffer each).
+# astc_arena = 1
 # A render target that needs an image of its own takes the image of a released one of the same size and format
 # instead of making a new one (0 = always a new image).
 # tex_reuse = 1
@@ -267,8 +409,85 @@
 # Percent of the video memory in use above which textures give way: first those the game released, then those no
 # shader sampled for a while (tex_disuse); each is made again when used. The default lies under the 87 percent past
 # which game memory gets no copy in video memory (memory = mirror), which costs far more frame time than a texture
-# uploaded again. 0: textures never give way for video memory.
+# uploaded again. 0: textures never give way for video memory. 70 frees more on a card short of memory, and more
+# textures are made again (the low of the 0.10 previews set it).
 # tex_vram_pressure = 80
+# Seconds a texture the game released is kept once nothing uses it (0 to 900); then it goes, however much room is
+# left. In play the game took released textures back within a minute or not at all; one taken back after its drop is
+# made again and shows its stand-in for a frame. A texture whose content only the GPU made waits twice as long, and one
+# the GPU drew into since its last copy back to game memory stays. 0: released textures stay up to tex_released_mb for
+# the whole session (as before 0.10). Default: 60 (180 until 0.11.0). Read at start.
+# tex_released_hold = 60
+# Megabytes the released textures may hold (0: no bound). Past it the oldest go even when young; while tex_released_hold
+# is on, young ones may stay past it, up to twice it, as long as video memory and the system's commit have room.
+# What they hold at their fullest is video memory the game keeps for the rest of the session, so this is what the cache
+# costs. Default: a thirty-second of the video memory budget, at least 384 and at most 1024 (until 0.11.0 a quarter of
+# the budget, up to 8192: on a run through Hyrule Field that held 3.3 GB more video memory and saved one texture in
+# thirty from being loaded again). A larger value keeps more textures the game may take back, which are otherwise made
+# again and show their stand-in for a frame. Read at start.
+# tex_released_mb = 1024
+# A texture whose memory the game writes again with the bytes it already held is left as it is instead of being
+# uploaded (and, for most, decoded on the graphics card) a second time: its bytes are compared by a hash taken at the
+# upload. Textures up to 64 KB always were; since 0.11.0 those up to 8 MB are too. Running through Hyrule Field the
+# game does this all the time: 52,000 second uploads in three minutes without it, 600 with it. 0: only the small ones,
+# as before (for a comparison; nothing should look different). Read at start.
+# tex_same_big = 1
+# The texture cache counts its short waits in frames: a texture the game let go of may be dropped under video memory
+# pressure 2 seconds later, one nothing sampled for 2 seconds counts as idle, and so on. Above 60 fps those frame
+# counts always grew with the frame rate, so that the seconds stayed. Below 60 fps they did not shrink: the 2 seconds
+# were 4 at 30 fps and nearly 6 at 21, and the textures waiting them out held about three times the video memory on a
+# card that was already over its budget, which kept the frame rate down. 1 (the default) counts the seconds below 60
+# fps too, down to 15 fps, once the game has been under 60 fps for 8 seconds; 0: as before. Read at start.
+# tex_rate_low = 1
+# Texture compaction (experimental). Video memory is taken in blocks (vma_block_mb), and a block goes back to the
+# driver only once everything in it is freed: after a long session the blocks hold textures scattered between holes,
+# and the game holds a gigabyte or two of video memory it does not use. 1: textures no shader sampled for ten seconds
+# are copied on the GPU out of the emptiest blocks into the holes of fuller ones, a few per frame and only in frames
+# with time to spare, so those blocks go back. Nothing on screen moves and nothing is loaded again. The log's
+# "mem: holes" line says how much there is to gain, a "texture compaction: pass" line what each pass gave back.
+# 0, the default: off. Read at start.
+# tex_compact = 0
+# The free space inside the blocks, in MiB (64 to 65536), from which a compaction pass starts; one block's worth while
+# video memory is above tex_vram_pressure. Default: 256. Read at start.
+# tex_compact_min_mb = 256
+# The texture memory a compaction moves per frame at most, in MiB (1 to 32); a texture larger than this never moves.
+# Default: 8. Read at start.
+# tex_compact_frame_mb = 8
+# A texture of 1 MiB or more is copied out of the game's memory by several threads at once when it is first drawn,
+# instead of by the thread that draws alone (the same bytes, 2 to 3 times sooner). 0: one thread, as before 0.10.
+# Read at start.
+# par_jobs = 1
+# While the video memory in use is over tex_vram_pressure percent of the budget, the pipelines the game built ahead
+# of play and no draw has used yet are given back, a few hundred every 5 seconds: on a card short of video memory they
+# are what costs least to lose, and a draw that needs one later builds it again from the pipeline cache. 0: every
+# pipeline stays for the run, as before 0.10; tex_vram_pressure = 0 turns this off too. Read at start.
+# pipe_release = 1
+# The low-end GPU mode of 0.9.2 to 0.10.1 is gone: low_end_gpu = 1 in an older file does nothing, and the log says
+# so once. The settings it turned on are ordinary settings now, each off unless this file sets it, and none has a row
+# in the settings menu. Read at start.
+# mesh_emulation = 1 runs mesh shaders as compute where the card has none, in place of the mesh fallback (never on an
+# NVIDIA card). vram_heap_limit = auto and vram_reserve_mb = 512 keep video memory within what the driver reports
+# free. upload_batch_mb sends large texture upload batches to the GPU early (every batch goes at 64 MiB of staging at
+# the latest, so only a value below 64 acts). mirror_stage = 1 and submit_finish_gpu = 0 copy game memory for the GPU
+# while a frame is recorded and let the game wait less for the GPU. mirror_hot = 25 keeps pools the game refills every
+# frame in system memory. tex_clobber = 1 gives a texture read after another image was drawn over its memory memory
+# of its own. foliage = reduced draws no small grass or moss, off no foliage.
+# mesh_emulation = 0
+# vram_heap_limit = 0
+# vram_reserve_mb = 0
+# upload_batch_mb = 0
+# mirror_stage = 0
+# submit_finish_gpu = 1
+# mirror_hot = 0
+# tex_clobber = 0
+# foliage = full
+# Textures the game released that are kept as they are (1 to 16384); past this count only those that lose nothing
+# when dropped go. Default: one per 2 MB of the video memory budget, 2048 to 8192. Read at start.
+# tex_released_max = 4096
+# Past 16384 kept textures some go whatever they cost. 1: the cheapest first: those drawn over, then those that come
+# back unchanged from the game's memory (the oldest first), and only then those whose content only the GPU made, which
+# would come back empty. 0: the first one in release order that nothing showed for 2 seconds, of any kind (0.10.1).
+# tex_hard_order = 1
 # Megabytes of this process's commit above which the log says so. Windows counts video memory against the commit;
 # with a discrete GPU the video memory in use is left out of the comparison, since it is not in RAM. Textures no longer
 # give way at this bound: dropping one lowers both sides of the comparison alike, so nothing they could do brought the
@@ -294,6 +513,13 @@
 # fix_c0 = 1
 # New GPU memory pools start zero-filled, as Switch memory does.
 # fix_zero = 1
+# Build the water's screen coordinates per pixel and keep its absorption distance at 0 or more: without it water is
+# drawn as a rectangle over solid ground at the Hyrule Castle moat and the Castle Town canal from some camera
+# positions, and can turn into a red beam there. 0: the water's shaders as they are.
+# water_projective = 1
+# Lines are drawn as wide as the game sets them (it draws two a frame 4.5 pixels wide into a small mask). 0: every
+# line 1 pixel wide, as up to 0.9.1.
+# line_width = 1
 # Optimisations, 0 turns each off: skip bindings that did not change, remember shader lookups, reuse the previous
 # draw's pipeline when its state repeats, remember texture descriptors between draws, update descriptors in bulk,
 # skip push constants that did not change.
@@ -395,26 +621,55 @@
 # 3D render scale: the scene's size relative to the game resolution, game (5/6, the game's own 1600x900 at 1080p) or
 # a percentage (25 to 400, at most 4096 pixels a side); above 100 supersamples the scene (anti-aliasing). Read at start.
 # render_scale = game
+# Discrete GPUs: a game memory pool whose copies to and from video memory each frame reach this percentage of its size
+# is read and written by the GPU in system memory instead (0: every pool keeps its video memory copy). For GPUs and
+# buses short of bandwidth; on an RX 580 the pools the game refills every frame cost about 8 ms a frame in copies.
+# mirror_hot = 0
+# 2: the next Rebuild the Game compiles the game's code at -O2 instead of -O1 (faster game threads on a slower CPU, a
+# build several times longer). Read by tools/make_game.py; the environment variable NX2NAVI_GUEST_OPT wins.
+# guest_opt = 1
+# GPUs without mesh shaders (VK_EXT_mesh_shader: AMD before RDNA 2, NVIDIA before Turing): 1 runs the game's mesh
+# and task shaders (grass and other foliage) as compute shaders and draws what they make; 0 skips those draws. The
+# arena for their vertices and triangles is mesh_emu_mb MiB of video memory, with mesh_emu_tasks task records (3 KiB
+# each) per submission; with trace = perf the log says how much a submission used. Read at start.
+# mesh_emulation = 0
+# mesh_emu_mb = 256
+# mesh_emu_tasks = 16384
 # Scaling to the window when it is larger than the game resolution: fsr (AMD FSR 1) or bilinear, and FSR's sharpening
 # from 0 (off) to 100. Changes while the game runs take effect at once.
 # upscaler = fsr
 # sharpness = 80
+# Scaling of the 3D scene to the game resolution. The game draws its scene smaller than the picture and enlarges it;
+# the console does that with an upscaler of its own, which the port replaces: easu enlarges with an edge-adaptive
+# filter (the one FSR 1 scales with), which keeps edges sharp, and bilinear with the plain filter used before, which
+# is softer and costs a little less GPU time. DLSS and FSR 3.1 (dlaa = 1) scale the scene themselves, so this changes
+# nothing there, and it does not touch the movies. Changes while the game runs take effect at once.
+# standin_filter = easu
+# The 3D scene's share of the game resolution without DLSS or FSR 3.1 (dlaa = 0), Ocarina of Time: 0.75, the default,
+# is the game's own most (1920x1080 in its 2560x1440 picture), which the scaling above enlarges; 1 draws the scene at
+# the picture's full size and nothing enlarges it (the menu's Upscaling row calls it Native (100%)); 0 leaves the size
+# to the game's dynamic resolution, down to a third of the picture under load. A larger scene needs more of the
+# memory the game keeps for its render targets, which is set aside at the start: 1 takes 238 MiB more than 0.75 at
+# 2560x1440, 533 MiB more at 3840x2160 and 712 MiB more at 5120x2160, as dlss = dlaa does. Changes while the game runs
+# take effect at once up to the share the game started with, a larger one at the next start.
+# scene_share = 0.75
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen
 # window): fit, the default, keeps the shape, with black bars at the sides or above and below, so a 16:9 game in a wider
 # window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at
 # once.
 # aspect = fit
-# Anisotropic filtering of surface textures: game (the level the game asks for, as on the Switch) or 2, 4, 8, 16. Keeps
-# ground, roads and walls seen at a shallow angle sharp into the distance. Only filtered, mipmapped textures that tile
-# are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Changes while the game runs take
-# effect at once.
-# aniso = game
+# Anisotropic filtering of surface textures: game (the level the game asks for, as on the Switch, 1x or 2x) or 2, 4,
+# 8, 16. Default: 16. Keeps ground, roads and walls seen at a shallow angle sharp into the distance. Only filtered,
+# mipmapped textures that tile are raised; shadow maps, data maps and screen-sized buffers keep the game's setting.
+# Changes while the game runs take effect at once.
+# aniso = 16
 # Texture detail: auto, full, reduced or low. The textures of a loaded area are what fills a card with little video
 # memory, and three quarters of a texture is its largest mip level. reduced makes the large surface textures (256x256 and
 # more, with smaller levels) without that level, low without the two largest when they are 1024x1024 or more. Surfaces
 # seen up close look softer; interface art, small textures, shadow maps and everything the game draws itself keep their
-# size. auto picks by the video memory Windows grants the game: full from 8192 MiB (cards of 10 GB and more), low under
-# 6144 MiB (cards of 6 GB and less), reduced between (8 GB cards). Where the ASTC textures stay uncompressed (astc =
+# size. auto picks by the video memory Windows grants the game: full from 10240 MiB (cards of 12 GB and more), low under
+# 6144 MiB (cards of 6 GB and less), reduced between (8 and 10 GB cards), and never full on integrated graphics, whose
+# video memory is the PC's own memory. Where the ASTC textures stay uncompressed (astc =
 # cpu or astc_bc = 0) and the budget is under 20480 MiB, auto goes one step lower, as they take four times the memory.
 # The log says what was picked ("texture detail:"). Read at start.
 # texture_detail = auto
@@ -425,7 +680,8 @@
 
 # Shadow map resolution: the game's sun cascades are 960x960 (and its static shadow maps 1440 and 720) whatever the game
 # resolution; 2 to 4 draws them that many times larger on each side, for sharper shadows. 1 = the game's. The game's
-# shadow edge filter is narrowed by the same factor (translator patch 0011), so close shadow edges don't look doubled.
+# shadow edge filter is narrowed by the same factor (translator patch 0011), so close shadow edges don't look doubled,
+# and the game's slope-scaled depth bias grows by it, so the larger maps don't shadow the surfaces they are cast on.
 # Read at start.
 # shadow_scale = 1
 # Sun shadow cascade range in percent of the game's (its cascades end at 20, 40, 80 and 160 m), 50 to 400: higher moves
@@ -439,6 +695,12 @@
 # where an object meets the ground and softer the further its shadow falls. Done in the translated shaders (translator
 # patch 0010), so the shader cache is rebuilt once after an update. Read at start.
 # pcss = 0
+# Shadow edge filtering, 0 or 1. Default: off. 1 makes every shadow-map test blend the 2x2 shadow map texels around
+# it (hardware percentage-closer filtering) instead of testing one texel where the game's sampler asks for nearest
+# filtering: shadow edges turn from stair steps of shadow-map texels into soft ramps, and crawl less on the ground as the
+# camera moves. Costs a little GPU time. With shadow_scale above 1 it is on anyway. The log lists the filters of the
+# game's shadow samplers ("depth-compare sampler:"); where they are already linear this changes nothing. Read at start.
+# shadow_pcf = 0
 
 # NVIDIA DLSS / DLAA for the 3D scene, on NVIDIA RTX GPUs with the DLSS model from NVIDIA's DLSS SDK next to the
 # executable (Windows: nvngx_dlss.dll next to nx2navi.exe; Linux: libnvidia-ngx-dlss.so.<version> next to nx2navi, with the
@@ -448,7 +710,9 @@
 # What DLSS works from: dlaa (the 3D scene at full size), quality, balanced, performance or ultra_performance (the
 # scene at 67, 58, 50 or 33 % of the output, scaled up by DLSS; these replace render_scale and sharpen texture filtering
 # to match). They apply only with dlaa = 1 and the DLSS model next to the executable; otherwise the scene follows
-# render_scale. Changes while the game runs take effect at once.
+# render_scale. Changes while the game runs take effect at once, with one limit: the game's memory for render targets
+# is sized at the start for the mode set then, so dlaa chosen in the menu of a run that started with a smaller mode
+# (or with dlaa = 0) renders at 75 % until the next start.
 # dlss = dlaa
 # AMD FSR in DLSS's place, on any GPU (Windows): with taa = fsr3 and dlaa = 1 the scene is scaled by AMD FSR 3.1 in the
 # mode dlss names (dlaa is FSR's Native AA). The menu's Upscaling row sets all of these. Changes while the game runs
@@ -480,32 +744,76 @@
 # characters, a little more flicker). Any other model by its letter, a to m: on slower RTX cards the older model e is
 # cheaper. Changes while the game runs take effect at once (DLSS starts a new history).
 # dlss_preset = default
-# DLSS keeps one network per picture size (gameplay, the pause screen). 1: one unused for 3,600 frames is freed.
+# DLSS keeps one network per picture size (gameplay, the pause screen). 1: one unused for 3,600 frames is freed, and
+# ten seconds after the upscaler or frame generation is switched off in the menu, the networks and pictures they held
+# are freed too (switched on again later, they are made again, which the first frame waits for).
 # 0: none is ever freed (about 0.5 GB more video memory after the first pause). 2: as 1, and the networks that stay
 # are not made again when another is made (shows striped pause screens; for tests).
 # dlss_idle_free = 1
+# When DLSS or FSR lets go of a network, an FSR context or a picture (a new picture size, the pause screen, a mode
+# change). 0: it is freed once the graphics card has finished the frames that used it, and the game does not wait.
+# 1: the game waits for the graphics card to finish all its work at each such change, as up to 0.10.1 (what was let
+# go of still goes once the card is past it): a hitch of a frame or more at each change. For comparison, or if 0 shows
+# a fault. Read at start.
+# upscaler_idle_wait = 0
+# One DLSS network for the render sizes of a DLSS mode. 1: the network made for the mode's own render size also takes
+# the smaller render sizes DLSS allows on it (dynamic resolution's steps with dyn_res = 1, a screen that renders
+# smaller than play), so a change of size makes no new network and keeps the picture DLSS has built up. 0: every
+# render size has its own network and starts its picture anew. The log says for each network which render sizes it
+# takes, and counts the changes of size that kept the picture against those that made a network. 0 is the default:
+# the shared network has been compiled and not yet run on a graphics card. Read at start.
+# dlss_range = 0
+# Where DLSS or FSR 3.1 works in the frame (a test, off by default). 0: on the finished picture, after the game has
+# added its bloom, applied its exposure and tonemapped it. 1: on the scene's own light, before the bloom chain and the
+# tonemap, as these upscalers are made for; the bloom, the lens flares and the tonemap then work on the upscaler's
+# picture, drawn at the picture's size when the scene is smaller. Frames without the bloom (menus) stay as with 0.
+# The log says where it ran (lines starting with "dlaa: prebloom"). Changes apply at the next frame.
+# dlss_prebloom = 0
 # Per-object motion vectors for DLSS: characters, animals and moving objects get their own motion instead of the
 # camera's, so DLSS keeps their history instead of smearing or rejecting it. Costs some CPU time each frame (about 1-2 ms
 # on a laptop CPU); 0 leaves camera-only motion. Read at start.
 # dlaa_objmv = 1
+# Motion vectors of Link's own for DLSS, FSR 3.1 and frame generation (game 1.1.1): Link and the equipment attached to him are
+# drawn a second time with last frame's pose, so fast turns, attacks and jumps move by their real motion instead of an
+# estimate from colour and depth. 1, the default; 0: the estimate, as before 0.10.0. It reads the player's equipment
+# from the game's memory at every submission. Read at start.
+# motion_guard_degrees (35, 45 or 60, the default): a part that turns more than this in one frame is checked against
+# last frame's depth before its vector is written.
+# selective_motion = 1
+# Motion vectors of their own for every other skinned character (game 1.1.1): people, animals and enemies are drawn a
+# second time with last frame's pose too, so DLSS, FSR 3.1 and frame generation follow them as they move instead of
+# smearing them along the camera's motion. A character's draw is matched with last frame's by its mesh and shaders;
+# where the match is in doubt (it just appeared, another one of the same model appeared or left) it keeps the camera's
+# motion for a few frames. 1, the default; 0: the camera's motion for all of them, as before. Nothing runs without
+# DLSS or FSR 3.1. The "selective motion" log line counts the skinned draws and why some kept the camera's motion.
+# Read at start.
+# skin_motion = 1
 # Characters' trails: where a character, animal or held item moves without motion vectors of its own (all of them with
 # dlaa_objmv = 0), DLSS can drag a faint copy of it. The G-buffer marks those objects; on them and where they were the
 # frame before, DLSS is told to favour the current frame by this percentage (0, 35, 65 or 100; 0 off). Higher removes
 # more of the trails and leaves those edges a little less smooth. Changes while the game runs take effect at once.
 # dlss_char_mask = 65
-# The game's own FXAA after the post effects; with DLAA on it is not needed. Changes while the game runs take effect at
-# once.
+# Anti-aliasing of the 3D picture: game (the game's own SMAA, as on the console), off, fxaa, smaa (SMAA at its Ultra
+# preset in the game's place) or taa (DLSS or FSR at full size: dlaa = 1 with dlss = dlaa, which the menu's
+# Anti-aliasing row sets with it, and the game's SMAA). With DLSS or FSR on (dlaa = 1, any mode) their TAA always runs,
+# and game, off, fxaa or smaa runs along with it: off leaves the edges to the TAA alone. Changes while the game runs
+# take effect at once.
+# aa = game
+# The FXAA switch of the game this runtime was first written for; Ocarina has no such pass, so it changes nothing here
+# (aa above is the setting).
 # fxaa = 1
 # Frame generation: off, fsr3 (AMD FSR 3.1 on any GPU where amd_fidelityfx_vk.dll loads, so not on Linux: one generated
 # frame between every two the game draws, the HUD kept out of it) or dlss (NVIDIA DLSS Frame Generation on GeForce RTX
 # 40 and 50 GPUs, paced with Reflex; it needs nx2navi_dlssg.dll and NVIDIA Streamline's files next to the executable,
-# which the setup puts there). Both need DLSS or FSR 3.1 upscaling (dlaa = 1). While frame generation runs, fps_limit
+# which the setup puts there). Both run with any upscaling: with DLSS or FSR 3.1 (dlaa = 1) they take its depth and
+# motion vectors, and without one (dlaa = 0) the same ones made for them alone, with no jitter (the log's "dlaa: frame
+# generation runs" line says which). While frame generation runs, fps_limit
 # counts the frames the game draws and the screen shows that times the multiplier (2 for fsr3); fps_limit = display
 # alone holds the screen to the monitor's rate and the game to that rate divided by the multiplier.
 # fsr3 takes effect at once, dlss (on or off) at the next start.
 # framegen = off
 # On Linux dlss runs through NVIDIA's NGX itself, without Streamline: it needs dlaa = 1 with DLSS when the game starts
-# and NVIDIA's libnvidia-ngx-dlssg.so.<version> (from NVIDIA's DLSS SDK repository) beside the game, then switches at
+# (it keeps running when dlaa is switched off later) and NVIDIA's libnvidia-ngx-dlssg.so.<version> (from NVIDIA's DLSS SDK repository) beside the game, then switches at
 # once, and its multiplier is fg_mult: 2 to 6 (above 2 needs an RTX 50 GPU) or dynamic, which generates only the frames
 # needed to reach the display's refresh rate at the rate the game draws. framegen_multiplier is not used there.
 # fg_mult = 2
@@ -515,13 +823,30 @@
 # Each step adds a little latency, and a display shows no more than its refresh rate. Changes while the game runs
 # take effect at once.
 # framegen_multiplier = 2
+# With framegen = dlss, Reflex holds fps_limit where each frame starts, before the controller is read, and the game's
+# own limiter keeps only its ceiling of 240 frames a second: a finished picture no longer waits for its turn, which
+# takes up to a frame of the game's off the delay from the controller to the screen. The game's own limiter takes the
+# limit back while a movie plays, while the window is minimised, and for the rest of the run when the frames show that
+# Reflex does not hold it; the log's "frame rate:" lines say which one holds it. 0 leaves the limit to the game's own
+# limiter, as before 0.11.0. Needs the nx2navi_dlssg.dll of 0.11.0 or later (an older one leaves the limit to the
+# game). Changes while the game runs take effect at once.
+# reflex_limit = 1
+# Low latency without frame generation: 0 off, 1 on, 2 on with boost (NVIDIA's: the GPU keeps a high clock; on AMD 2
+# is 1). The graphics driver holds each frame's start, so the game reads the controller as late as the picture allows
+# and no finished picture waits for its turn: NVIDIA's low-latency mode (VK_NV_low_latency2) or AMD's Anti-Lag
+# (VK_AMD_anti_lag), whichever the driver has. On a driver with neither the setting does nothing. While it is on the
+# driver holds the game to fps_limit, in place of the game's own limiter and of RivaTuner Statistics Server (rtss).
+# With framegen = dlss on Windows, DLSS Frame Generation's own low latency is used and this setting is not; with
+# framegen = fsr3 it runs on AMD GPUs and is off on NVIDIA ones while frames are generated. Turning it on takes effect
+# at the next start: a run that starts with 0 leaves the driver's mode off the graphics device altogether. In a run
+# that started with it on, changes take effect at once.
+# low_latency = 0
 
 # HDR output, two kinds (both need HDR on in Windows, "Use HDR", or a Wayland compositor with colour management;
-# without it the picture stays SDR, the game's own): hdr = 1 sends the game's scene tone mapped to your display, one
-# fixed look, and applies at once; hdr = native shows the game's own HDR mode, which the game takes up at the next
-# start. hdr_peak_nits is your display's peak, hdr_game_nits the picture's white (paper white, 203 is the HDR
-# reference) and hdr_ui_nits the HUD's and the menu's. The settings of the look of earlier versions
-# (hdr_tonemap, hdr_exposure, hdr_gamma and the rest) are read by nothing now and do no harm.
+# without it the picture stays SDR, the game's own): hdr = 1 sends the game's scene tone mapped to your display and
+# applies at once; hdr = native shows the game's own HDR mode, which the game takes up at the next start.
+# hdr_peak_nits is your display's peak, hdr_game_nits the picture's white (paper white, 203 is the HDR reference) and
+# hdr_ui_nits the HUD's and the menu's.
 # hdr = 0
 # hdr_live = 0 leaves the HDR path out of a run that starts with hdr = 0, as before hdr followed the menu: switching
 # HDR on then takes a restart. Only worth setting if the picture differs with it at 1.
@@ -529,12 +854,52 @@
 # hdr_peak_nits = 1000
 # hdr_game_nits = 203
 # hdr_ui_nits = 203
+# The settings from here to the end of this section shape the picture of hdr = 1 and apply at once; hdr = native does
+# not take them. Left as they are, they give the one look hdr = 1 had from 0.9.0 to 0.10.1, which read none of them: a
+# value your file still holds from an older version counts again.
+# The tone mapper: vanilla is the game's own curve at SDR brightness; psychov35 sends the scene through a model of the
+# eye's response, matched to the game's mid grey and tone, up to the peak; renodrt carries the game's SDR look up to
+# the peak by brightness.
+# hdr_tonemap = psychov35
+# Gamma correction, with every tone mapper: 2.2 or 2.4 shows the picture as a display of that power would, as the game
+# was made to be seen; off keeps the sRGB curve, which leaves the darkest tones well above black.
+# hdr_gamma = 2.2
+# With psychov35: where the scene's mid grey lands (vanilla: where the game's curve puts it; render: at the scene's
+# value); whether the mid tones get the contrast of the game's curve; the tone curve's steepness through mid grey from
+# 0 to 100 (50 unchanged); and in percent how much bright colours turn as where the game's SDR picture clips (fire
+# towards yellow and white).
+# hdr_midgray = vanilla
+# hdr_match_slope = 1
+# hdr_tone_slope = 50
+# hdr_hue_clip = 50
+# With psychov35 and renodrt: exposure in percent (100 unchanged); highlights, shadows, contrast and saturation from 0
+# to 100 (50 unchanged).
+# hdr_exposure = 100
+# hdr_highlights = 50
+# hdr_shadows = 50
+# hdr_contrast = 50
+# hdr_saturation = 50
+# With renodrt: highlight saturation from 0 to 100 (50 unchanged); blowout (bright parts towards white) and flare
+# (lifted blacks) from 0 to 100 (0 none); hue correction in percent (how much bright colours keep their hue); grade,
+# the percentage of the game's own colour grading the picture keeps.
+# hdr_highlight_sat = 50
+# hdr_blowout = 0
+# hdr_flare = 0
+# hdr_hue = 100
+# hdr_grade = 100
+
 [language]
 # Language: a Windows locale such as de-DE, or a Switch code (en-US, ja, zh-Hant, ...). Default: the Windows locale.
 # locale = en-US
 # lang = en-US
 # System mode reported to the game: docked or handheld.
 # operation_mode = docked
+# Speed of the game's message windows (game 1.1.1; live): normal (the game's), fast (three times as fast; the
+# pauses the text holds stay as long) or instant (each page shows at once, as the game shows it when you press the
+# button that turns the page while it types).
+# Messages the game does not let you hurry, such as text timed against a cutscene or a voice, keep their speed.
+# Needs a game built with this version (the launcher's Rebuild the Game); the menu row shows once it is.
+# text_speed = normal
 # Language of the settings menu and the overlay: en, ru, pt-BR or zh-Hans. Default: the Windows display language, English if
 # it is none of them.
 # menu_lang = en
@@ -552,71 +917,6 @@
 # The key of the application's uploaded art asset (Rich Presence > Art Assets) shown as the status's large image.
 # discord_image = nx2navi_512x512
 
-[coop]
-# Co-op: your own game and save, with the other players' progress shared through a relay (docs/coop.md). Positions are
-# not shared yet: you do not see the other players in your world.
-# The menu's Co-op tab sets the name, the relay and the rules below, and makes, joins, accepts and leaves a room.
-# 0 = off: no socket is opened, no name is looked up and nothing is sent. Takes effect at once.
-# coop = 0
-# Co-op is a beta: the menu shows its Co-op tab only with coop_beta = 1, which no menu row sets. Takes effect at once.
-# coop_beta = 0
-# Your name for the other players, at most 24 bytes. Default: Player- and four random hex digits.
-# coop_name =
-# The relay, host or host:port (default port 24680): run one with `python tools/coop_relay.py` and forward its UDP port, or
-# use one a friend runs. No default: with none set the session stays idle and the log says why.
-# coop_server =
-# The local UDP port, 0 = any. For a firewall rule or a port forward when testing on a LAN. Takes effect at the next start.
-# coop_port = 0
-# For tests and LAN parties, no menu row: coop_auto = create or join starts a session at launch (a join needs coop_room, the
-# room's secret of 18 characters from 23456789BCDFGHJKMNPRSTVWXYZ, XXXXXX-XXXXXX-XXXXXX; a create without it makes a new
-# one). While the session runs, a room the relay lost (a restart) is made again or waited for (asked for every 10 s; a
-# refusal for too many joins from your network waits a minute), and a create that finds the room open joins it. Joining
-# is not accepting: nothing from the room is applied before you accept it (coop_accept).
-# off = no session at launch.
-# coop_auto = off
-# coop_room =
-# Test: percent of received co-op datagrams thrown away, 0 to 100.
-# coop_drop = 0
-# The rules of a room you make (a room you join uses its maker's; the log names them). Take effect at once.
-# Story, world and dungeon progress: shared or own.
-# coop_progress = shared
-# Equipment, key items, upgrades; songs; medallions, stones and the other quest items: shared or own. Own only with
-# coop_progress = own: in a shared world a chest one player opened is empty for the others.
-# coop_items = shared
-# coop_songs = shared
-# coop_quest = shared
-# Small keys: pool = every key anyone picks up goes into the dungeon's pool and every door anyone opens takes one out of it;
-# own = keys stay with the player who picked them up (doors still open for everyone). Own with coop_progress = own.
-# coop_keys = pool
-# Rupees and ammunition: own, or pool = one count every player adds to and spends from.
-# coop_rupees = own
-# coop_ammo = own
-# Nothing from a room is applied to your game before you accept who is in it (by their keys) and its rules, and before
-# your save is copied to coop-backup in the profile folder (docs/coop.md: going back). ask = the log shows each room's
-# offer with a number (eight hex digits, new at each start of the game); accept it on the menu's Co-op tab, or put that
-# number here while the game runs to accept that offer (this line as the file is now counts, before the one read at
-# start). A new member, other rules or another save loaded make a new offer with a new number (another save joins the
-# pools only once you accept it). A member who never says who it is keeps the room from being accepted. Your key pools
-# count only you and the players you accepted, among those the room's maker lets use them. Every message that can
-# change your save is signed by the player who sent it, so someone who knows the room's secret and runs the relay (or
-# sends from its address on your network) can read and disturb the room but not set flags in a player's name.
-# Accepting every room (always) is taken from the environment only (NX2NAVI_COOP_ACCEPT=always), never from this file,
-# so an ini someone hands you cannot accept a room for you.
-# coop_accept = ask
-# The room's maker (the Co-op tab's Remove and Reset the pools do the same): coop_remove = a player's key fingerprint
-# (xxxx-xxxx-xxxx-xxxx, as the log and the tab show it beside each member; without dashes it may be all digits), in the
-# room or after it left; every game drops that key and what it took from the pools, and keys others brought while it
-# was in a pool stay theirs. A member number here is not taken: numbers pass to other players as members come and go.
-# coop_reset_pools = a new value (1, then 2, or 0 and then 1 again): every game joins the pools again with what they
-# held for the players in the room, and what each held counts from the reset on. A player who drained a pool and is
-# still in the room when you reset keeps what it took: remove it first, then reset (both in one save of this file act
-# in that order).
-# Both are read from this file once a second while you are in a room, and each value acts once. The key your game signs
-# the rules of a room you made with is kept in the profile folder (coop-keys, readable by your account only), so a
-# restart keeps you the room's maker; never hand out a copy of the profile folder.
-# coop_remove =
-# coop_reset_pools =
-
 [audio]
 # none mixes without opening an audio device.
 # audio = default
@@ -628,6 +928,20 @@
 # Host priority of the game's audio thread: 0 leaves it alone, 1 raises it to the highest while its audio update is
 # read (the audio render thread waits for that), 2 also keeps it above normal. Takes effect at the next start.
 # audio_game_prio = 0
+# When the game changes a sound's volume, go from the old volume to the new one across the 5 ms of sound that follow,
+# as the console does (1, the default). 0 applies the new volume at once, which clicks when a volume moves quickly (a
+# fade, a sound passing by). Takes effect at the next start.
+# audio_ramp = 1
+# After the sound was held up (the PC was busy and a gap was heard), skip as much sound as the gap was long, so the
+# sound keeps its place against the picture as on the console (1, the default). Gaps of more than 3 seconds are not
+# skipped. 0 plays on from where the sound stopped, which leaves it later than the picture by every gap so far.
+# Takes effect at the next start.
+# audio_catchup = 1
+# When the game sends an audio value this version cannot use (an effect setting out of range, an id it does not have),
+# that effect or sound is left out and the log gets one line per kind (0, the default). 1 ends the game there instead,
+# with the details in the log, as versions before 0.11.0 did for most of them: for bug reports. Takes effect at the
+# next start.
+# audio_strict = 0
 # Volume in percent (0 to 100), on top of the game's own. Changes while the game runs take effect at once.
 # volume = 100
 # Speakers: stereo, 5.1 or auto (5.1 when the Windows speaker setup has six or more channels, stereo otherwise). The
@@ -648,11 +962,26 @@
 # Gamepad motion controls (0 = off) and vibration (0 = off).
 # motion = 1
 # rumble = 1
+# Sprint button (game 1.1.1): Link sprints without rolling first. off (the default), l3 (the left stick's click, which
+# has no other use) or b (the game's B button, the bottom one of the Nintendo layout: it sprints only while Link moves
+# and puts the weapon away as usual otherwise; with the game's Swap Jump Controls B is the jump, so use l3). sprint_mode: toggle (press to sprint and again to stop; the sprint
+# also ends when Link stops, attacks, rolls, targets, uses an item, swims or climbs) or hold. The Controls tab's
+# Sprint rows set both; changes take effect at once.
+# sprint_button = off
+# sprint_mode = toggle
 # Rumble strength in percent (0 to 300; 0 = off) and the exponent on the amplitude (0.2 to 1.5; lower = weak pulses
 # stronger, 1 = linear). rumble_triggers = 1 also drives the impulse triggers of an Xbox pad.
 # rumble_strength = 130
 # rumble_curve = 0.6
 # rumble_triggers = 0
+# HD rumble for a Switch Pro Controller, a Joy-Con or a pair of them: 1 sends the game's vibration to the controller as
+# the game makes it, each side's low and high band with its own frequency and amplitude, in place of two motor
+# strengths. rumble_strength still scales the amplitude (its default, 130, is exactly the game's; the controller's
+# safe maximum is never passed) and rumble_curve does not apply. 0 (default), and every other gamepad: the motors, as before. Changes
+# while the game runs take effect at once. rumble_hd_ms is the shortest time between two rumble reports in
+# milliseconds (5 to 50, default 15): raise it if a controller on Bluetooth stutters or disconnects with HD rumble on.
+# rumble_hd = 0
+# rumble_hd_ms = 15
 # PlayStation 3 controller (DualShock 3), Windows: 1 reads its buttons, sticks and rumble directly from the controller
 # when no driver presents it to the game as a gamepad; 0 (default) leaves it to SDL and XInput. Changes while the game
 # runs take effect at once.
@@ -720,13 +1049,13 @@
 
 [mods]
 # Folder with the player's mods, one subfolder per mod (<name>/romfs, <name>/exefs, <name>/cheats). A relative folder
-# is under the game's folder. Default: mods next to the game's exe. The setup builds the ExeFS patches and code cheats
-# of the mods folder next to the exe only.
+# is under the game's folder. Default: mods next to the game's exe. The build takes the ExeFS patches and code cheats
+# of the mods folder next to the exe only. The launcher's Mods screen adds mods and puts downloads in order.
 # mods_dir =
 # Load order, top first, names separated by |; a mod not listed goes below the listed ones, by name. The top mod wins a
-# file two mods replace. Set it here: the in-game menu has no Mods tab.
+# file two mods replace. The launcher's Mods screen sets it (Load Order); the in-game menu has no Mods tab.
 # mods_order =
-# Mods switched off, names separated by |.
+# Mods switched off, names separated by |. The launcher's Mods screen sets it.
 # mods_disabled =
 # auto: when an enabled mod has cheats that change the game's code and the game was built without them, the game starts
 # the setup's rebuild at start (a few minutes) and starts again after it. off: the game starts with the code it has.
@@ -748,14 +1077,48 @@
 # cheat_0123abcd = 1
 
 [diagnostics]
-# Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present, coop or all. The menu's
+# Extra lines in the log, comma separated: svc, host, ipc, fs, gfx, perf, sched, audio, present or all. The menu's
 # Performance log sets perf (frame timings). Default: none.
 # trace = perf
+# A game thread that waits this many seconds for a lock, or for another thread to end, is logged once with the thread
+# it waits for and what that one is doing (at most 24 lines a run): a game that stops then leaves the chain in its log.
+# Off by default: its thread takes the game's thread lock every 2 seconds. 10 is a good value for a hang report.
+# wait_watch_s = 0
+# 1: what the game's present closes for the frame (the DLSS state, the motion tables, the frame count conditional
+# draws go by) is closed between two replays: when another game thread is replaying at the present, the next
+# submission does it first thing, or the present thread before the picture's blit, and the game's present goes on at
+# once. 0: at the present, as in 0.10.1, whatever another thread replays (a rare one-frame fault at area changes).
+# Read at start.
+# present_order = 1
+# A report in the log when nothing moves for this many seconds: no frame shown while the window is in front, or a GPU
+# submission not finished. It names who holds the present and queue locks and what the game's threads wait for, at
+# most three times a run; the game goes on. 0 turns it off. Read at start.
+# hang_watch_s = 20
+# Diagnosis: one log line per frame while Link stands near a moving floor (the floating platforms): the frame's step,
+# how far he moved and how far the floor moved. 1 writes 4000 lines, a larger number that many; 0 is off.
+# floor_probe = 0
+# Diagnosis: while a floor carries Link sideways at 60 fps and the left stick rests, one snapshot of the game's memory
+# finds the values below him that move with him (the floor's position among them) and logs them once a second from
+# then on. The snapshot holds the game for about a second once. 1 writes 20000 lines, a larger number that many; 0 is
+# off.
+# floor_scan = 0
+# Diagnosis (Windows): 1 also runs floor_scan and, once it has found the floor, logs which code of the game reads and
+# writes it: hardware watchpoints on its addresses for a few seconds at 60 fps, and again at the next stretch at 120
+# fps or more with Link on the floor. Each pass slows the game for its few seconds. 0 is off.
+# floor_watch = 0
 # 1: with trace = perf, walks of the process's address space count its private and write-combined memory every 600
-# frames (the "mem: process" line) and where its committed memory lies every 3600 frames (the "commit census" lines).
-# Each walk holds the address-space lock for 100-240 ms and delays the next frame by as much, so they are off unless
-# asked for.
+# frames (the "mem: process" line; at every 3600th frame, and any other where the commit census walks, that walk
+# stands in for it) and where its committed memory lies every 3600 frames, and when the process's own commit (without
+# the video memory Windows charges to it) rose 1 GiB over the highest it was, at most once a minute (the "commit
+# census" lines). Each walk holds the address-space lock for 100-260 ms and delays the next frame by as much, so they
+# are off unless asked for: leave it off in a run whose smoothness is judged. With or without the trace, 1 also has
+# every memory report ask for the C runtime heap's summary in play, which holds every allocation of the game for as
+# long as it takes (50 to 70 ms with a heap of a few GB); without it the summary is taken before play only.
 # mem_census = 0
+# 1: with trace = perf, the process's handles counted by kind (events, sections, threads, files...) at the 600-frame
+# report when their number grew by 16 or more since the last count (the "mem: handles" line). It reads the system's
+# whole handle table on a thread of its own, 2-5 ms each time, and keeps a few MB for it. Read at start.
+# handle_census = 0
 # The memory the game is taken to need, in MB of commit (RAM plus page file not yet promised to a program). When less
 # is free at the start, the log gets a warning line: short of memory the game stutters, loses textures or stops with
 # an out-of-memory or lost-device error. The default is what the game took in play at 3840x2160 on an RTX 5090; the
@@ -769,14 +1132,45 @@
 # takes longer than flight_spike_ms (0 to 60000).
 # flight = 0
 # flight_spike_ms = 100
+# The flight recorder also saves them after a one-frame flash: a frame whose picture differs from the frame before and
+# the frame after while those two are alike (0: not). The three pictures are compared as 16x9 cells of mean
+# brightness: at least flight_flash_cells cells (1 to 144) must be more than flight_flash_diff (4 to 255, of 255)
+# brighter or darker than in both other frames. Lower values catch smaller and fainter flashes and take more of the
+# game's own effects for one. At most one such save every 30 seconds; a flash the game means (lightning) counts
+# too, and one while the camera turns fast does not. It needs the recorder's thumbnails. Read at start.
+# flight_flash = 1
+# flight_flash_diff = 24
+# flight_flash_cells = 3
+# Stutter map: the log gets a line for each hitch (a frame over 2.5 times the frames before it and at least 12 ms, or
+# over 25 ms) with the area, what the frame waited for and the pipelines and shaders its draws met missing; a run of
+# consecutive long frames counts as one hitch with their summed time. Every 5 minutes of play, when the window loses
+# the focus in play and at exit, a map of the areas by their hitches and of the pipelines that cost the most.
+# tools/stutter_map.py reads it. 0: off. Read at start.
+# stutter_map = 0
 # GPU pass marks: after a GPU crash (device lost) the log names the render pass or dispatch the GPU had started and the
 # last one it finished. Unset: on AMD GPUs (VK_AMD_buffer_marker). 1: also on NVIDIA GPUs
 # (VK_NV_device_diagnostic_checkpoints), which NVIDIA says costs a little. 0: off.
 # pass_crumbs = 1
+# Pipelines built without the video driver's shader optimiser: the same picture, slower shaders in those pipelines.
+# mesh: only the pipelines with task and mesh shaders (terrain, foliage). 1: all. 0: none.
+# Unset (default): mesh on AMD's Windows driver for the RX 5000 and RX 6000 series and older, where the device is lost
+# ("driver timeout") in render passes that start with such a pipeline; 0 on every other driver. On those cards 0 gives
+# the optimised pipelines back.
+# vk_noopt = mesh
+# GPU draw marks, for a GPU crash (device lost) that comes back in the same place on an AMD GPU: inside each render pass
+# a mark is written wherever the shaders change, and after the crash the log names the shaders of the draws the GPU had
+# not finished, not only the pass. It costs a little frame rate, so it is off unless a crash is being tracked down.
+# Needs the pass marks above (AMD GPUs). Default: 0.
+# draw_crumbs = 1
 # A test of how the game ends when the video card stops answering (device lost): the hand-over to the GPU queue with
 # this number is not made and is taken as one the driver refused with a lost device. The log then holds one report and
 # one FATAL line, and the game ends with exit code 72. 0: never. Default: 0.
 # device_lost_at = 0
+# A test of the page write generations (how the renderer tells which game memory changed since it last looked): they
+# start after this number instead of 0, so a run reaches 4294967296, where the 32-bit generations of versions before
+# 0.11.0 ran out, within its first seconds (4294966000 does that). Decimal, or hexadecimal with 0x; at most
+# 4611686018427387904. The log says where they start. Nothing else changes. Read at start. Default: 0.
+# gen_seed = 0
 # Once a second, puts the crash report's exception filter back if a GPU driver or an overlay loaded after the start set
 # its own in its place, and says so in the log. Without it, a crash in such a DLL can end the game with no FATAL line in
 # the log. 0: off.
@@ -797,9 +1191,11 @@
 # sync_wake_all = 0
 # 1 (default): a thread of its own writes the log lines, to the log file and the console, so a write that stalls (a
 # busy disk, a virus scanner, a console that scrolls) no longer holds the thread that logged, which is often the one
-# that draws the frame. A crash, a fatal error and the end of the game write out what is still queued first. 0: each
-# line is written by the thread that logs it, as before. Either way a "log: ... writes of the log took over 2 ms" line
-# counts the slow writes and says whose time they took.
+# that draws the frame. It writes the lines of a quarter of a second together, sooner when many are waiting, so the
+# log file and the console are up to that much behind the game. A crash, a fatal error and the end of the game write
+# out what is still queued first; a game that is ended from outside (Task Manager) loses those last lines. 0: each
+# line is written at once by the thread that logs it, as before. Either way a "log: ... writes of the log took over
+# 2 ms" line counts the slow writes and says whose time they took.
 # log_async = 1
 # 1: the frame-time summary also splits the replay by op kind (draw, bind, transfer), which says where a stalled frame
 # went. The clock reads cost a fraction of a millisecond a frame, so it is off by default.
@@ -812,6 +1208,12 @@
 # "ref" is perf_lock_timing_here, which the link map names), the recorder's waits, and the texture lock's holds over
 # 1 ms. Off by default.
 # lock_time = 0
+# 1: with trace = perf, the "mem: sizes" line also counts the recording copies (the game's recorded command lists,
+# kept until the game hands their control memory over again) that no submission used for 5 minutes and whose control
+# memory the game has written over since, or no longer maps: copies the game will not use again. A thread of its own
+# reads 16 bytes of game memory for each new copy, and for up to 4096 known copies every 5 seconds; nothing is freed.
+# The count is a lower bound: memory written over with the same bytes is not seen. Read at start. Default: 0.
+# copy_retire = 0
 # Texture entries the bindless texture pool may create in one refresh (images and their uploads); the rest wait for
 # the next refresh and show their stand-in until then. Lower spreads streaming over more frames (smaller hitches, a
 # frame or two of pop-in); higher loads sooner.
@@ -826,6 +1228,14 @@
 # area's textures are there, instead of showing the ground and the walls black for the first seconds. 0: never.
 # pool_load_backlog = 512
 # pool_load_ms = 50
+# Idle 2 MiB regions of game memory are made read-only so that the per-frame checks for CPU writes skip them. Right
+# after an area load such a freeze can take 4-30 ms instead of microseconds, so after a slow one the freezes wait
+# (250 ms, doubled for each further slow one up to 2 s) and start the doubling over only after freeze_quiet_ms without
+# a slow one (0: after any fast freeze, as in 0.10.1). None is made while an area's textures load nor for
+# freeze_load_hold_ms after that or after an area loads (0: no such hold). The regions wait meanwhile; their checks
+# cost a few microseconds per MiB each submission until they are frozen.
+# freeze_quiet_ms = 5000
+# freeze_load_hold_ms = 3000
 # Written storage-buffer ranges up to this size in MiB (1 to 256) go back to game memory as a merge, in 4 MiB pieces:
 # copied within video memory and only the words that changed written over PCIe. Larger ones are copied back whole at
 # the end of every submission. Raising it from 4 to 16 took a 5.5 MiB range off the plain copies (about 46 MiB a frame
@@ -861,6 +1271,13 @@
 # at the start of buffers of several MiB about twice a second. 0: the whole buffer comes back and everything near it
 # is copied back every frame for up to 32 seconds, as before (a tenth fewer frames a second in a village).
 # wb_lazy_chunk = 0
+# With wb_lazy: 1 (default): when the game's CPU code touches memory the video card wrote, the copy that brings it
+# back holds up only the threads that touch that memory; the game's other threads, the video card's bookkeeping and
+# file reads go on meanwhile, and several such copies can run at once. 0: every such copy holds them all up until it
+# is done and the copies run one at a time, also those made when video memory runs short, as in 0.10.1; only a thread
+# that touches memory while it is being copied still waits for that copy alone. Set 0 if the game ends or the graphics
+# device is lost where it did not before, and send the log.
+# wb_lazy_unlocked = 1
 # Barriers between the game's draw passes and compute dispatches. 1: only where the game itself asks for one, or where
 # the work changes between drawing and compute; this takes about a tenth off the graphics card's time for a frame.
 # 0: a full barrier before every pass and every dispatch. Default: 1 on NVIDIA graphics cards, 0 on all others, where it
@@ -872,12 +1289,22 @@
 # mesh_ahead = 1
 # Graphics cards without mesh shaders (GTX 10 series, RX 500 and 5000 series, many integrated ones): the game's mesh
 # draws, most of the world, are computed in compute passes and drawn as ordinary triangles. auto (default) does that
-# only on such a card; 1 does it on every card (for testing: it is slower than mesh shaders); 0 never, and such a
-# card then draws no world.
+# on such a card, and on the RX 6000 series with AMD's Windows driver, where the game drawn with mesh shaders lost the
+# graphics card in play ("driver timeout", the game ends with code 72); there it costs some frame rate, and a place's
+# ground, rocks and plants show a moment late the first time they are drawn in a run. 1 does it on every card (for
+# testing: it is slower than mesh shaders); 0 never: an RX 6000 card then draws with mesh shaders as version 0.10.1
+# did, and a card without them draws no world.
 # mesh_fallback = auto
 # Video memory in MB for what those compute passes hand to the draws. A draw that needs more loses the geometry that
 # does not fit, and the log says so.
 # mesh_fallback_mb = 128
+# Threads that prepare those compute passes for the mesh programs a place uses, the first time each is drawn (until
+# then its draws are left out). auto (default): one for each 4 logical processors, 1 to 4.
+# mesh_fallback_workers = auto
+# 1 (default): while the colour draw of a patch of grass or leaves is left out because it is still being prepared, its
+# depth draw is left out too, so the ground shows as it does without the grass. 0: the depth draw is made alone, as
+# before, and the sky's colour can show through the ground in the shape of the grass until the patch is ready.
+# mesh_fallback_hold = 1
 # Windows, 1 (experimental): the game's heap is committed a 64 KiB run at a time where it is first used, instead of
 # all of it when the game sizes it. Windows counts committed memory against RAM plus the page file whether it is used
 # or not, and in Castle Town after Hyrule Field about 3.4 of the heap's 6.8 GiB had never been used. 0: committed up
@@ -896,3 +1323,8 @@
 # those second writes cost about 3 ms of GPU time a frame. 0 (default): every mirror sends them. A pool that needs them
 # and is left without shows as foliage stretched into columns or flickering.
 # gpa_twin_max_kb = 0
+# 1 (default): shaders that follow the game's pointers read a memory pool's new copy in video memory only once that
+# copy has been filled; until then they read the game's own memory. 0: they read the new copy at once, as up to 0.9.2,
+# where a card over its video memory budget could lose the device at an area load (a GPU read fault at the first byte
+# of the new copy).
+# gpa_late = 1

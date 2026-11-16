@@ -49,7 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
 
-from launcher import build, feed, gameini, gamefiles, jobs, net, saves, settings, toolchain, updater, versions, winsys  # noqa: E402
+from launcher import build, feed, gameini, gamefiles, jobs, locks, net, saves, settings, toolchain, updater, versions, winsys  # noqa: E402
 from launcher.context import Context  # noqa: E402
 from launcher.paths import Layout  # noqa: E402
 
@@ -225,6 +225,21 @@ def fake_repo(folder, damage=None):
     (folder / 'ucrt64.db').write_bytes(tar_bytes(entries))
 
 
+def compiled_sleeper(exe, ms, code):
+    """exe compiled from a C program that sleeps ms milliseconds and exits with code, with the ucrt64 clang or a clang
+    on PATH; False without one. It stands in for the game under a name that no game runner watches."""
+    cc = next((c for c in (r'C:\msys64\ucrt64\bin\clang.exe', shutil.which('clang')) if c and Path(c).is_file()),
+              None)
+    if not cc:
+        return False
+    exe = Path(exe)
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    src = exe.with_suffix('.c')
+    src.write_text(f'#include <windows.h>\nint main(void) {{ Sleep({ms}); return {code}; }}\n', encoding='utf-8')
+    subprocess.run([cc, '-O1', '-o', str(exe), str(src)], check=True, capture_output=True, timeout=300)
+    return True
+
+
 def fake_fast_repo(folder, clang_version='1.0-1'):
     """The CLANG64 packages toolchain.FAST_PACKAGES names, in folder/clang64."""
     folder = folder / 'clang64'
@@ -365,6 +380,32 @@ class PlayerIniTest(Tmp):
         gameini.put(self.tmp, 'discord', 'discord_rpc', '1')
         self.assertEqual(ini.read_bytes(), PLAYER_INI + b'\r\n\r\n[discord]\r\ndiscord_rpc = 1\r\n')
 
+    def test_a_comment_after_a_value_as_the_game_reads_it(self):
+        """runtime/cfg.c cut_comment: for a key whose row has a set of values (choices=True), a blank followed by ';'
+        or '#' starts a comment, "key = ; note" has no value, and a value in double quotes keeps its text; free text,
+        the mods folder and lists the launcher writes, keeps the whole value. tests/cfg_parse_check.py has the same
+        lines for the game."""
+        ini = self.tmp / 'nx2navi.ini'
+        body = (b'[frame rate]\r\npace_smooth = 0 ; off\r\nfps_limit = 144 # my monitor\r\nvk_present = fifo\t; x\r\n'
+                b'aspect = ; later\r\ndlss_preset = "k ; quoted"\r\n[mods]\r\nmods_dir = D:\\My Mods #2\r\n'
+                b'mods_disabled = a #1|b ; c\r\n')
+        ini.write_bytes(body)
+        for key, want in (('pace_smooth', '0'), ('fps_limit', '144'), ('vk_present', 'fifo'), ('aspect', ''),
+                          ('dlss_preset', 'k ; quoted')):
+            self.assertEqual(gameini.get(self.tmp, key, choices=True), want, key)
+        self.assertEqual(gameini.get(self.tmp, 'fps_limit'), '144 # my monitor')
+        self.assertEqual(gameini.get(self.tmp, 'mods_dir'), 'D:\\My Mods #2')
+        self.assertEqual(gameini.get(self.tmp, 'mods_disabled'), 'a #1|b ; c')
+        from launcher import mods
+        self.assertEqual(mods._names(self.tmp, 'MODS_DISABLED'), ['a #1', 'b ; c'])
+        # a key's line that has only a comment has no value as the game reads it: the change goes on the line before
+        ini.write_bytes(b'vk_present = fifo\r\nvk_present = ; later\r\n')
+        gameini.put(self.tmp, 'display', 'vk_present', 'mailbox', choices=True)
+        self.assertEqual(ini.read_bytes(), b'vk_present = mailbox\r\nvk_present = ; later\r\n')
+        ini.write_bytes(b'pace_smooth = 0 ; off\r\n')   # the line is written again whole, as the game's menu writes it
+        gameini.put(self.tmp, 'performance', 'pace_smooth', '1', choices=True)
+        self.assertEqual(ini.read_bytes(), b'pace_smooth = 1\r\n')
+
     def test_the_older_installer_changes_the_language_line_only(self):
         """installer/ini.py sets the language, in the older installer's last step at every install and update: the
         one line goes under [language] with the file's own line ends, and every other byte stays (it used to write
@@ -498,6 +539,19 @@ class UninstallTest(Tmp):
 # ---------------------------------------------------------------- toolchain
 
 class ToolchainTest(Tmp):
+    def test_zstd_missing(self):
+        """A Python without compression.zstd and zstandard is named at startup, with the pip line for a checkout."""
+        with mock.patch.dict(sys.modules, {'compression.zstd': None, 'zstandard': mock.MagicMock()}):
+            self.assertEqual(toolchain.zstd_missing(self.layout), '')
+        with mock.patch.dict(sys.modules, {'compression.zstd': None, 'zstandard': None}):
+            msg = toolchain.zstd_missing(self.layout)
+            ctx = Context(self.layout)
+        self.assertIn('zstandard', msg)
+        self.assertIn('-m pip install -r', msg)
+        self.assertIn('requirements-launcher.txt', msg)
+        self.assertEqual(ctx.zstd_missing, msg)
+        self.assertTrue(any(msg in line for line in ctx.log_tail()))
+
     def test_resolve_and_install(self):
         repo = self.tmp / 'repo'
         repo.mkdir()
@@ -643,6 +697,159 @@ class NetTest(Tmp):
             net.download(srv.url + 'f.bin', self.tmp / 'out' / 'h.bin', cancel=lambda: True)
         with self.assertRaises(net.DownloadError):
             net.download(srv.url + 'missing.bin', self.tmp / 'out' / 'm.bin')
+
+    def test_the_download_total(self):
+        """progress gets the whole file's size as its total: the expected size, else the length the server names
+        plus what the part file holds, else the bytes so far. A resumed answer without a length gave the part
+        file's size as the total, so the bar passed 100 %."""
+        data = os.urandom(2 * net.CHUNK + 500)
+        have = 1000
+
+        class Answer(io.BytesIO):   # what net.request returns: the rest of the file after a Range request
+            status = 206
+            length = None
+
+            def __init__(self, headers):
+                super().__init__(data[have:])
+                self.headers = headers
+
+        def fetch(headers, **kw):
+            dest = self.tmp / 'total' / 'f.bin'
+            shutil.rmtree(dest.parent, ignore_errors=True)
+            dest.parent.mkdir()
+            dest.with_name('f.bin.part').write_bytes(data[:have])
+            seen = []
+            with mock.patch.object(net, 'request', lambda url, h, timeout, version: Answer(headers)):
+                net.download('https://example.invalid/f.bin', dest, progress=lambda d, t: seen.append((d, t)), **kw)
+            self.assertEqual(dest.read_bytes(), data)
+            self.assertEqual(seen[-1][0], len(data))
+            return seen
+
+        for d, t in fetch({}):                                            # no length, no expected size
+            self.assertEqual(t, d)                                        # (the part's 1000 bytes as the total before)
+        for d, t in fetch({'Content-Length': str(len(data) - have)}):     # the length of the rest
+            self.assertEqual(t, len(data))
+        for d, t in fetch({}, size=len(data)):                            # the expected size, whatever the server says
+            self.assertEqual(t, len(data))
+        for d, t in fetch({'Content-Length': '7'}, size=len(data)):
+            self.assertEqual(t, len(data))
+
+    def test_a_part_file_of_another_download_is_not_resumed(self):
+        """A part file is resumed only for the file it was begun for (f.bin.part.of names it by the expected sha256).
+        One begun for other bytes under the same name, as when a release is published again, is deleted with a log
+        line; resumed, it ended in a sha256 error that read as a damaged download. The same file from another
+        server and a part without a note are resumed."""
+        old, new = os.urandom(6000), os.urandom(6000)
+        (self.tmp / 'f.bin').write_bytes(new)
+        srv = Server(self.tmp)
+        self.addCleanup(srv.close)
+        dest = self.tmp / 'out' / 'f.bin'
+        dest.parent.mkdir()
+        part, note = dest.with_name('f.bin.part'), dest.with_name('f.bin.part.of')
+        part.write_bytes(old[:2000])                                      # cut while the old release downloaded
+        note.write_text(f'sha256 {sha(old)}')
+        lines = []
+        net.download(srv.url + 'f.bin', dest, sha256=sha(new), size=len(new), log=lines.append)
+        self.assertEqual(dest.read_bytes(), new)
+        self.assertIsNone(srv.hits[-1][1].get('Range'))                   # from the start
+        self.assertEqual(len(lines), 1)
+        self.assertIn('f.bin.part was begun for another file', lines[0])
+        self.assertFalse(part.exists() or note.exists())                  # nothing stays beside the finished file
+        dest.unlink()
+        part.write_bytes(new[:2000])                                      # cut during this same file, on another server
+        note.write_text(f'sha256 {sha(new)}')
+        other = srv.url.replace('127.0.0.1', 'localhost')
+        net.download(other + 'f.bin', dest, sha256=sha(new), size=len(new), log=lines.append)
+        self.assertEqual(srv.hits[-1][1].get('Range'), 'bytes=2000-')
+        self.assertEqual((dest.read_bytes(), len(lines)), (new, 1))
+        dest.unlink()
+        part.write_bytes(new[:3000])                                      # left by a launcher that wrote no note
+        net.download(srv.url + 'f.bin', dest, sha256=sha(new), size=len(new), log=lines.append)
+        self.assertEqual(srv.hits[-1][1].get('Range'), 'bytes=3000-')
+        self.assertEqual(dest.read_bytes(), new)
+        with self.assertRaises(net.Cancelled):                            # a cut download says what its part is of
+            net.download(srv.url + 'f.bin', self.tmp / 'out' / 'c.bin', sha256=sha(new), cancel=lambda: True)
+        self.assertEqual((self.tmp / 'out' / 'c.bin.part.of').read_text(), f'sha256 {sha(new)}')
+        self.layout.downloads.mkdir(parents=True, exist_ok=True)
+        (self.layout.downloads / 'x.zip.part.of').write_text('sha256 0')
+        updater.prune(self.layout)                                        # and a note left behind is cleared away
+        self.assertEqual(list(self.layout.downloads.iterdir()), [])
+
+    def low_disk(self, free):
+        """shutil.disk_usage as net sees it, answering with free[0] bytes free."""
+        import collections
+        usage = collections.namedtuple('usage', 'total used free')
+        return mock.patch.object(net.shutil, 'disk_usage', lambda path: usage(10 ** 12, 0, free[0]))
+
+    def test_the_free_space_is_asked_before_a_download(self):
+        """A download whose rest does not fit the disk stops before a byte is written, says how much is needed and
+        how much is free, and keeps its part file for when there is room; a disk that fills in the middle is named
+        as full at once instead of being tried four times."""
+        data = os.urandom(5000)
+        (self.tmp / 'f.bin').write_bytes(data)
+        srv = Server(self.tmp)
+        self.addCleanup(srv.close)
+        dest = self.tmp / 'out' / 'f.bin'
+        dest.parent.mkdir()
+        part = dest.with_name('f.bin.part')
+        part.write_bytes(data[:1000])
+        free = [40 << 20]
+        with self.low_disk(free):
+            self.assertEqual(net.space_problem(dest.parent, 1 << 20, 'x'), '')            # 1 MB and the margin fit
+            self.assertEqual(net.space_problem(self.tmp / 'not' / 'made' / 'yet', 1 << 20, 'x'), '')
+            with self.assertRaises(net.NoSpace) as refused:                              # the expected size is known:
+                net.download(srv.url + 'f.bin', dest, sha256=sha(data), size=64 << 20)   # no request is made
+            self.assertEqual(srv.hits, [])
+            self.assertIn('no room for f.bin on ', str(refused.exception))
+            self.assertIn('MB needed, 42 MB free', str(refused.exception))
+            self.assertEqual(part.read_bytes(), data[:1000])
+            free[0] = 1 << 20
+            with self.assertRaises(net.NoSpace):                                         # else the server's length is
+                net.download(srv.url + 'f.bin', dest, sha256=sha(data))
+            self.assertEqual(len(srv.hits), 1)
+            self.assertEqual(part.read_bytes(), data[:1000])                             # kept for when there is room
+            free[0] = 1 << 30
+            net.download(srv.url + 'f.bin', dest, sha256=sha(data), size=len(data))
+            self.assertEqual(dest.read_bytes(), data)
+            self.assertEqual(srv.hits[-1][1].get('Range'), 'bytes=1000-')
+
+        class Full(io.BytesIO):   # an answer whose bytes cannot be written: the disk filled meanwhile
+            status, length, headers = 200, None, {}
+
+            def read(self, n=-1):
+                raise OSError(28, 'No space left on device')
+
+        with mock.patch.object(net, 'request', lambda url, h, timeout, version: Full()), \
+                mock.patch.object(net.time, 'sleep') as slept, self.assertRaises(net.NoSpace) as refused:
+            net.download('https://example.invalid/g.bin', self.tmp / 'out' / 'g.bin')
+        slept.assert_not_called()
+        self.assertIn('is full: g.bin could not be written', str(refused.exception))
+        with mock.patch.object(net.shutil, 'disk_usage', side_effect=OSError('no such drive')):
+            self.assertEqual(net.space_problem(dest.parent, 1 << 40, 'x'), '')            # cannot be asked: not refused
+
+    def test_the_free_space_is_asked_before_an_unpack(self):
+        z = make_app_zip(self.tmp, '0.9.0', extra={'big.bin': bytes(3 << 20)})
+        free = [2 << 20]
+        with self.low_disk(free):
+            with self.assertRaises(updater.UpdateError) as refused:
+                updater.safe_extract(z, self.tmp / 'x')
+            self.assertIn('no room for the files of NX2navi-app-0.9.0.zip', str(refused.exception))
+            self.assertFalse((self.tmp / 'x').exists())                                  # nothing was unpacked
+            from launcher import mods
+            with self.assertRaises(mods.ModError) as refused:
+                mods.unpack(z, self.tmp / 'mod')
+            self.assertIn('no room for its files', str(refused.exception))
+            self.assertFalse((self.tmp / 'mod').exists())
+            lock = {'packages': [{'name': 'p', 'version': '1', 'filename': 'p.pkg.tar.zst', 'sha256': '0' * 64,
+                                  'csize': 5 << 20, 'isize': 50 << 20}]}
+            with mock.patch.object(net, 'download') as fetched, self.assertRaises(toolchain.ToolchainError) as refused:
+                toolchain.install(self.layout, lock, log=lambda line: None)
+            fetched.assert_not_called()                                                  # asked before the first download
+            self.assertIn('no room for the build tools', str(refused.exception))
+            self.assertIn('(91 MB needed, 2 MB free)', str(refused.exception))            # 5 + 50 MiB and the margin
+            free[0] = 1 << 30
+            updater.safe_extract(z, self.tmp / 'x')
+        self.assertEqual((self.tmp / 'x' / 'big.bin').stat().st_size, 3 << 20)
 
     def test_plain_http_redirects_and_oversize(self):
         with self.assertRaises(net.DownloadError):                        # refused before any connection
@@ -913,7 +1120,7 @@ class BackgroundUpdateTest(Tmp):
         self.game = str(self.tmp / 'game')
         self.running = False   # what build.game_running answers: a copy of the game the launcher did not start
         saved = build.game_running
-        build.game_running = lambda game_dir, exe='ocarina.exe': self.running
+        build.game_running = lambda game_dir, exe='ocarina.exe', log=None: self.running
         self.addCleanup(setattr, build, 'game_running', saved)
         self.restarts = []
 
@@ -1541,13 +1748,14 @@ class MakeGameTest(Tmp):
         (kits[1] / 'runtime' / 'h.h').write_text('#define V 2\n')        # the new version changed the header
         self.assertEqual(go(kits[1])[:2], (1, 0))
 
-    def main_with(self, romfs, lift, compile_):
-        """make_game.main() in this process for a first build, with the given step functions in place of the real
+    def main_with(self, romfs, lift, compile_, rebuild=False):
+        """make_game.main() in this process, with the given step functions in place of the real
         lift and compile (they need real modules and clang). Returns the SystemExit code, or 0."""
         sys.path.insert(0, str(self.layout.pydeps))   # the fake zbic
         saved = (self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv)
         self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile = romfs, lift, compile_
-        sys.argv = ['make_game.py', '--nup', str(self.nup), '--out', str(self.out), '--msys', str(self.msys),
+        source = ['--rebuild'] if rebuild else ['--nup', str(self.nup)]
+        sys.argv = ['make_game.py', *source, '--out', str(self.out), '--msys', str(self.msys),
                     '--until', 'compile']   # the shaders step needs the shader translator
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -1558,6 +1766,37 @@ class MakeGameTest(Tmp):
         finally:
             self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv = saved
             sys.path.remove(str(self.layout.pydeps))
+
+    def test_retry_interrupted_lift_after_cache_cleanup(self):
+        layout = self.out / 'build-cache' / 'lift' / 'layout.json'
+        ran = []
+
+        def lift(out, cache):
+            ran.append('lift')
+            layout.parent.mkdir(exist_ok=True)
+            layout.write_text('[]')
+
+        def compile_(out, cache, msys, jobs, romfs_job, update):
+            ran.append('compile')
+            self.assertTrue(layout.is_file())
+
+        def interrupted(out, cache):
+            lift(out, cache)
+            raise SystemExit(1)  # layout exists again, but the lift did not finish
+
+        with mock.patch.object(self.mg, 'WIN', True):  # use the fixture's MSYS toolchain check
+            self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_), 0)
+            self.nup.unlink()
+            ran.clear()
+            shutil.rmtree(layout.parent)
+            self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+            self.assertEqual(ran, [])  # cleaning the cache alone does not require a compile
+
+            with mock.patch.object(self.mg, 'kit_version', return_value='updated kit'):
+                self.assertEqual(self.main_with(self.mg.step_romfs, interrupted, compile_, rebuild=True), 1)
+                self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+                self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+            self.assertEqual(ran, ['lift', 'lift', 'compile'])
 
     def test_romfs_beside_lift_and_compile(self):
         """A first build packs the RomFS image while the lift and the compile run; the compile gets the running step
@@ -1863,7 +2102,8 @@ class MakeGameTest(Tmp):
     def test_shaders_key_names_the_translator_the_build_uses(self):
         """A source checkout has its translator in build/xlate/ (tools/build_xlate.py), not in the kit's bin/: the
         shaders key follows its identity, so a rebuilt translator prepares the shaders again. A kit's bin/ comes first
-        when both exist, and a kit with no translator is refused with the way to build one."""
+        when both exist. A kit with no translator has a key that says so (the keys are worked out before the steps
+        run, steps_to_run), and the build refuses it with the way to build one when it needs the translator."""
         from unittest import mock
         kit = self.tmp / 'kit'
         (kit / 'tools').mkdir(parents=True)
@@ -1887,8 +2127,9 @@ class MakeGameTest(Tmp):
             self.assertEqual(key(), from_bin)
             shutil.rmtree(kit / 'bin')
             shutil.rmtree(xlate)
+            self.assertTrue(key().endswith('|missing'))
             with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
-                key()
+                self.mg.xlate_source()
             self.assertIn('tools/build_xlate.py', err.getvalue())
 
     def test_prompts_step(self):
@@ -1958,12 +2199,13 @@ class MakeGameTest(Tmp):
             self.assertEqual(build()[2], 3)
             (art / 'T_X_B_White.png').write_bytes(b'picture two')
             self.assertEqual(build()[2], 4)
-            # the lift running again makes the compile and the shaders run, not the prompts
+            # the lift running again makes the compile run, not the shaders (their key names the lift and the
+            # compile they depend on, make_game.py UNAFFECTED) nor the prompts
             st = json.loads((self.out / 'build-cache' / 'state.json').read_text())
             del st['steps']['lift']
             (self.out / 'build-cache' / 'state.json').write_text(json.dumps(st))
             others, ev, runs = build()
-            self.assertEqual((others, states(ev), runs), (['compile', 'lift', 'shaders'], ['skip'], 4))
+            self.assertEqual((others, states(ev), runs), (['compile', 'lift'], ['skip'], 4))
             # a kit without art: skipped, the folders an earlier build drew stay
             shutil.rmtree(kit / 'prompt-art')
             self.assertEqual(build(), ([], [{'ev': 'step', 'step': 'prompts', 'state': 'skip'}], 4))
@@ -2587,7 +2829,10 @@ class MakeGameTest(Tmp):
             self.assertEqual(build_shaders.stale(rt), [font])
         menu = (ROOT / 'runtime' / 'ui' / 'menu.cpp').read_text(encoding='utf-8')
         self.assertIn('#ifdef __has_embed\n#embed "fonts/Roboto-Medium.ttf"\n#else\n#include "roboto_ttf.h"\n#endif', menu)
-        self.assertEqual(build_shaders.EMBEDDED, {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h'})
+        # the menu font, and the SMAA lookup textures of the anti-aliasing setting (runtime/vk_aa.c)
+        self.assertEqual(build_shaders.EMBEDDED, {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h',
+                                                  'third_party/smaa/AreaTex.bin': 'smaa_area_tex.h',
+                                                  'third_party/smaa/SearchTex.bin': 'smaa_search_tex.h'})
 
     def test_objects_of_an_earlier_version_are_taken_over(self):
         """An entry under a key an earlier version gave the same compile is re-recorded under the new key when its
@@ -2658,6 +2903,55 @@ class MakeGameTest(Tmp):
         self.assertTrue(self.mg.shader_carry(out))
         (out / 'nx2navi.ini').write_text('[performance]\nNX2NAVI_SHADER_CARRY = "0"\n')
         self.assertFalse(self.mg.shader_carry(out))
+
+    def test_shader_carry_reads_the_switch_as_the_game(self):
+        """shader_carry reads NX2NAVI_SHADER_CARRY as runtime/cfg.c does: 0, off, false and no in any case are off, a
+        comment after a blank is cut unless the value is in double quotes, the file's last line with a value wins and
+        the environment wins over the file. A line the game reads as off and this as on would skip a preparation the
+        game does not make up for."""
+        out = self.tmp / 'game'
+        (out / 'shader-cache').mkdir(parents=True)
+        (out / 'shader-prepared.bin').write_bytes(b'x')
+        (out / 'shader-cache' / 'identities.txt').write_text('# translators\n' + 'ab' * 32 + '\n')
+        ini = out / 'nx2navi.ini'
+        env = {k: v for k, v in os.environ.items() if k.upper() != 'NX2NAVI_SHADER_CARRY'}
+        with mock.patch.dict(os.environ, env, clear=True):
+            for text, carry in (('shader_carry = off\n', False), ('shader_carry = FALSE\n', False),
+                                ('shader_carry = no\n', False), ('shader_carry = 0 ; note\n', False),
+                                ('shader_carry = 0\t# note\n', False), ('shader_carry = 1 # on\n', True),
+                                ('shader_carry = on\n', True), ('shader_carry = "0 ; quoted"\n', True),
+                                ('shader_carry = 0\nshader_carry = on\n', True),
+                                ('shader_carry = on\nshader_carry = off\n', False),
+                                ('shader_carry = 0\nshader_carry = ; nothing\n', False)):
+                ini.write_text(text)
+                self.assertEqual(self.mg.shader_carry(out), carry, text)
+            ini.write_text('shader_carry = 0\n')
+            with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CARRY': '1'}):
+                self.assertTrue(self.mg.shader_carry(out))   # the environment wins over the file
+            ini.write_text('shader_carry = 1\n')
+            with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CARRY': 'Off'}):
+                self.assertFalse(self.mg.shader_carry(out))
+
+    def test_guest_opt_from_the_ini_counts_without_the_low_end_mode(self):
+        """guest_opt_ini takes guest_opt from nx2navi.ini by itself. Up to 0.10.1 it needed low_end_gpu on in the file;
+        that mode is gone, and a low_end_gpu line of any value changes nothing. The environment's value stays."""
+        out = self.tmp / 'game'
+        out.mkdir()
+        env = {k: v for k, v in os.environ.items() if k.upper() != 'NX2NAVI_GUEST_OPT'}
+        for low in ('', 'low_end_gpu = 1\n', 'low_end_gpu = yes\n', 'low_end_gpu = 0\n', 'low_end_gpu = off\n',
+                    'low_end_gpu = 0 ; note\n'):
+            (out / 'nx2navi.ini').write_text('guest_opt = 2\n' + low)
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.mg.guest_opt_ini(out)
+                self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '2', low)
+        (out / 'nx2navi.ini').write_text('low_end_gpu = 1\n')
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.mg.guest_opt_ini(out)
+            self.assertIsNone(os.environ.get('NX2NAVI_GUEST_OPT'))   # no guest_opt line: nothing is set
+        (out / 'nx2navi.ini').write_text('guest_opt = 2\n')
+        with mock.patch.dict(os.environ, dict(env, NX2NAVI_GUEST_OPT='1'), clear=True):
+            self.mg.guest_opt_ini(out)
+            self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '1')   # the environment wins over the file
 
     def test_cache_from_before_carrying_names_its_translator(self):
         """Before a new translator goes beside the game, a shader cache with no identities.txt gets one naming the
@@ -2897,6 +3191,9 @@ class MakeGameTest(Tmp):
             (out / 'exefs' / name).write_bytes(b'x')
         (lift / 'layout.json').write_text(json.dumps([{'name': 'main'}]))
         text = self.mg.modules_c(lift, out, gen).read_text(encoding='utf-8')
+        import check_content
+        self.assertIn(check_content.GENERATED_MARKER, text.splitlines()[0])
+        self.assertIn('generated from game code', check_content.problems_for(gen / 'modules.c'))   # refused in a commit
         for half in ('\\ud83e', '\\ud842'):   # the first surrogate halves of the two characters
             self.assertNotIn(half, text.lower())
         want = 'const char rt_default_exefs[] = "' + str(out / 'exefs').replace('\\', '\\\\') + '";'
@@ -3083,7 +3380,8 @@ class MakeGameTest(Tmp):
         code, _ = self.main_rebuild(lambda out, cache: None, stop)
         self.assertEqual(code, 1)
         st = json.loads((self.out / 'build-cache' / 'state.json').read_text())
-        self.assertEqual(sorted(st['steps']), ['exefs', 'lift', 'romfs'])
+        # the shaders' record stays as the lift left it: the step's key names what it depends on (UNAFFECTED)
+        self.assertEqual(sorted(s for s in st['steps'] if s != 'shaders'), ['exefs', 'lift', 'romfs'])
         self.assertEqual(build.built_version(self.out), '')   # no finished build on record
         self.assertTrue(build.can_rebuild(self.out))
         self.assertTrue(build.installed(self.out))
@@ -3628,6 +3926,313 @@ class JobTest(Tmp):
         (game / 'romfs' / 'romfs.bin').unlink()   # the image is gone: only the dump brings it back
         self.assertEqual(jobs.InstallJob(ctx, self.tmp / 'g.nup', game).args()[0], '--nup')
 
+    def test_a_reader_sees_each_step_as_one_change_left_it(self):
+        """The worker, the build's reader thread and the window change a job while the window reads it. Under
+        job.locked() a step's state comes with the value and fraction that belong to it, every change counts in
+        rev (the window draws again when rev changed, and learns from it that the job ended), and the output's
+        last lines can be copied while lines arrive."""
+        ctx = self.make_ctx('ok')
+        self.addCleanup(ctx._file.close)
+        j = jobs.Job(ctx, ['lift', 'compile'])
+        stop = threading.Event()
+        wrong, errors = [], []
+
+        def work():
+            while not stop.is_set():
+                for sid in ('lift', 'compile'):
+                    j.begin(sid, 'starting')
+                    j.progress(sid, 0.5, 'half')
+                    j.finish(sid)
+                    j.log(f'working on {sid}')
+                    with j.locked():
+                        j.step(sid).state, j.step(sid).value, j.step(sid).fraction = jobs.PENDING, 'Waiting', 0.0
+
+        def read():
+            try:
+                while not stop.is_set():
+                    with j.locked():
+                        seen = [(s.state, s.value, s.fraction) for s in j.steps]
+                    for state, value, fraction in seen:
+                        ok = {jobs.PENDING: value == 'Waiting' and fraction == 0.0,
+                              jobs.RUNNING: value.endswith('%') and value == f'{int(fraction * 100)}%',
+                              jobs.DONE: value.startswith('Done') and fraction == 1.0}[state]
+                        if not ok:
+                            wrong.append((state, value, fraction))
+                    j.last_lines(6)
+            except Exception as e:   # noqa: BLE001 - whatever a reader meets is the failure
+                errors.append(e)
+
+        threads = [threading.Thread(target=work), threading.Thread(target=read), threading.Thread(target=read)]
+        for t in threads:
+            t.start()
+        time.sleep(0.5)
+        stop.set()
+        for t in threads:
+            t.join(30)
+        self.assertEqual((wrong[:3], errors), ([], []))
+
+        counted = jobs.Job(ctx, [])
+        touchers = [threading.Thread(target=lambda: [counted._touch() for _ in range(20000)]) for _ in range(4)]
+        for t in touchers:
+            t.start()
+        for t in touchers:
+            t.join(60)
+        self.assertEqual(counted.rev, 80000)                             # no change was lost
+        try:
+            from launcher.ui.app import App
+        except ImportError:
+            return
+        a = mock.MagicMock()                                             # the job screen's rows, from a real job
+        a.job = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game')
+        a.job.begin('tools')
+        a.job.progress('tools', 0.25)
+        rows = App.rows_job(a)
+        self.assertEqual((rows[0].kind, rows[0].value, rows[0].fraction), ('progress', '25%', 0.25))
+        self.assertEqual([r.kind for r in rows].count('divider'), 1)     # after the game data, as before
+        self.assertEqual(rows[-1].kind, 'action')                        # Cancel
+
+
+# ---------------------------------------------------------------- one launcher, one job
+
+# Another launcher process: it takes the lock file argv[2] as argv[3], says so and holds it until its input closes.
+HOLDER = ('import sys; sys.path.insert(0, sys.argv[1]); from launcher import locks; '
+          'lock = locks.FileLock(sys.argv[2], sys.argv[3]); print("held", flush=True); sys.stdin.read()')
+
+
+class LockTest(Tmp):
+    """launcher/locks.py: one process works in a launcher folder at a time, and in it one job on the same thing."""
+
+    make_ctx, patch_tools = JobTest.make_ctx, JobTest.patch_tools
+
+    def holder(self, layout, what='the launcher window'):
+        """A second process holding layout's lock as what, until the test ends or it is killed."""
+        p = subprocess.Popen([sys.executable, '-c', HOLDER, str(ROOT), str(layout.instance_lock), what],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+        def end():
+            p.kill()
+            p.wait()
+            p.stdin.close()
+            p.stdout.close()
+        self.addCleanup(end)
+        self.assertEqual(p.stdout.readline().strip(), 'held')
+        return p
+
+    def test_a_second_launcher_is_refused_and_told_who_holds_the_folder(self):
+        other = self.holder(self.layout)
+        with self.assertRaises(locks.Busy) as refused:
+            locks.FileLock(self.layout.instance_lock, 'the launcher window', where=self.layout.root)
+        self.assertIn(f'the launcher window (process {other.pid}, since ', str(refused.exception))
+        self.assertIn(str(self.layout.root), str(refused.exception))
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        said = []
+        with mock.patch.object(app, 'tell', said.append), mock.patch.object(app.tk, 'Tk') as window, \
+                mock.patch.object(app.winsys, 'dpi_aware'), mock.patch.object(app.winsys, 'app_id'), \
+                mock.patch.object(app, 'single_instance', lambda layout, wait: locks.FileLock(
+                    layout.instance_lock, 'the launcher window', where=layout.root)):   # without the wait
+            self.assertEqual(app.main(['--root', str(self.layout.root)]), 0)
+        window.assert_not_called()                 # no second window
+        self.assertEqual(len(said), 1)
+        self.assertIn(f'NX2navi is already running: the launcher window (process {other.pid}', said[0])
+
+    def test_the_lock_goes_when_its_process_dies(self):
+        other = self.holder(self.layout)
+        other.kill()                               # no clean exit: the operating system lets go of the lock
+        other.wait()
+        mine = locks.FileLock(self.layout.instance_lock, 'the launcher window', wait=10)
+        self.addCleanup(mine.release)
+        # the window's own jobs share its lock, and it stays the window's until the window lets go of it
+        job = locks.FileLock(self.layout.instance_lock, 'a job')
+        job.release()
+        job.release()                              # letting go twice lets go once
+        self.assertIn(locks._key(self.layout.instance_lock), locks._files)
+        mine.release()
+        self.assertNotIn(locks._key(self.layout.instance_lock), locks._files)
+
+    def test_a_folder_that_cannot_hold_a_lock_file_refuses_nobody(self):
+        gone = self.tmp / 'no such folder' / 'launcher.lock'
+        with locks.FileLock(gone, 'the launcher window'), locks.FileLock(gone, 'another'):
+            self.assertFalse(gone.exists())
+
+    def test_a_job_does_not_run_while_another_process_holds_the_folder(self):
+        self.patch_tools()
+        ctx = self.make_ctx('ok')
+        self.addCleanup(ctx._file.close)
+        other = self.holder(ctx.layout, '"rebuild" from the command line')
+        j = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline()
+        self.assertEqual(j.result, 'failed')
+        self.assertIn(f'"rebuild" from the command line (process {other.pid}', j.error)
+        self.assertIn('try again', j.error)
+        self.assertEqual({s.state for s in j.steps}, {jobs.PENDING})     # nothing of it ran
+        self.assertFalse(any('working on' in ln for ln in j.lines))
+        check = jobs.Job(ctx, [])                  # a job that changes no file (the update check) runs beside it
+        check.run = lambda: None
+        self.assertEqual(check.run_inline().result, 'ok')
+        other.stdin.close()                        # the other process ends
+        other.wait()
+        j = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline()
+        self.assertEqual(j.result, 'ok', j.error)
+        self.assertEqual(locks._files, {})         # and the job let go of the folder when it ended
+
+    def test_two_jobs_on_one_folder(self):
+        self.patch_tools()
+        ctx = self.make_ctx('ok')
+        self.addCleanup(ctx._file.close)
+        started, go = threading.Event(), threading.Event()
+
+        class Slow(jobs.RebuildJob):
+            def run(self):
+                started.set()
+                go.wait(30)
+
+        first = Slow(ctx, self.tmp / 'game').start()
+        self.addCleanup(go.set)
+        self.assertTrue(started.wait(30))
+        second = jobs.RebuildJob(ctx, self.tmp / 'game').run_inline()
+        self.assertEqual(second.result, 'failed')
+        self.assertEqual(second.error, 'the rebuild of the game is still running: wait for it to end, or cancel it')
+        self.assertEqual({s.state for s in second.steps}, {jobs.PENDING})
+        install = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline()
+        self.assertEqual(install.result, 'failed')                       # another kind of job on the same folder
+        self.assertIn('the rebuild of the game is still running', install.error)
+
+        class Download(jobs.Job):                  # what the background download claims: the app folder, not the game
+            claims = ('app',)
+            task = 'the background download of 9.9.9'
+
+            def run(self):
+                pass
+
+        self.assertEqual(Download(ctx, []).run_inline().result, 'ok')
+        elsewhere = Context(Layout(root=self.tmp / 'other root', app=ctx.layout.app))
+        self.addCleanup(elsewhere._file.close)
+        self.assertEqual(jobs.InstallJob(elsewhere, self.tmp / 'g.nup', self.tmp / 'game 2').run_inline().result, 'ok')
+        go.set()
+        for _ in range(300):
+            if first.result is not None:
+                break
+            time.sleep(0.1)
+        self.assertEqual(first.result, 'ok')
+        again = jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline()
+        self.assertEqual(again.result, 'ok', again.error)                # the first job let go when it ended
+        self.assertEqual((locks._files, locks._claims), ({}, {}))
+
+    def test_a_job_the_launcher_was_stopped_in_is_told_at_the_next_start(self):
+        """A job that writes into the game folder leaves data/job-running.json while it runs. Ended, also by an
+        error, it removes it; a launcher stopped in the middle leaves it, and the next start says which job did not
+        finish, once."""
+        self.patch_tools()
+        ctx = self.make_ctx('ok')
+        self.addCleanup(ctx._file.close)
+        marker = ctx.layout.data / jobs.MARKER
+        during = []
+
+        class Watched(jobs.RebuildJob):
+            def run(self):
+                during.append(json.loads(marker.read_text(encoding='utf-8')))
+
+        self.assertEqual(Watched(ctx, self.tmp / 'game').run_inline().result, 'ok')
+        self.assertEqual((during[0]['task'], during[0]['kind'], during[0]['game_dir']),
+                         ('the rebuild of the game', 'rebuild', str(self.tmp / 'game')))
+        self.assertFalse(marker.exists())
+        self.assertIsNone(jobs.interrupted(ctx))
+
+        class Failing(jobs.RebuildJob):
+            def run(self):
+                raise build.BuildError('the build stopped')
+
+        self.assertEqual(Failing(ctx, self.tmp / 'game').run_inline().result, 'failed')
+        self.assertFalse(marker.exists())                                # it ended and said so on screen
+        check = jobs.Job(ctx, [])
+        self.assertFalse(check._mark())                                  # a job that writes nothing there leaves none
+        self.assertTrue(jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game')._mark())   # stopped before its end
+        self.assertTrue(marker.exists())
+        self.assertEqual(jobs.interrupted(ctx)['task'], 'the installation of the game')
+        self.assertFalse(marker.exists())
+        self.assertIsNone(jobs.interrupted(ctx))                         # told once
+        marker.write_text('{"task": ')                                   # cut while it was written
+        self.assertIsNone(jobs.interrupted(ctx))
+        self.assertFalse(marker.exists())
+
+    def test_the_window_says_which_job_did_not_finish(self):
+        game = made_up_game(self.tmp / 'game')
+        App, a = mock_app(self, game)
+        a.args.selftest = False
+        a.ctx.zstd_missing = ''
+        self.assertTrue(jobs.RebuildJob(a.ctx, game)._mark())
+        App.start(a)
+        a.show.assert_called_once_with('home')
+        self.assertIn('stopped during the rebuild of the game', a.message)
+        self.assertIn('Rebuild the Game finishes', a.message)
+        a.ctx._file.flush()
+        self.assertIn('the launcher was stopped during the rebuild of the game',
+                      (self.layout.logs / 'launcher.log').read_text(encoding='utf-8'))
+        App, a = mock_app(self, self.tmp / 'no game yet')                # an install that was stopped: first run
+        a.args.selftest = False
+        a.ctx.zstd_missing = ''
+        self.assertTrue(jobs.InstallJob(a.ctx, self.tmp / 'g.nup', self.tmp / 'no game yet')._mark())
+        App.start(a)
+        a.show.assert_called_once_with('first_run')
+        self.assertIn('stopped during the installation of the game', a.message)
+        self.assertIn('Begin Installation goes on', a.message)
+        App, a = mock_app(self, game)                                    # the next start has nothing to tell
+        a.args.selftest = False
+        a.ctx.zstd_missing = ''
+        App.start(a)
+        self.assertEqual(a.message, '')
+
+    def test_a_failed_job_lets_go_of_the_folder(self):
+        self.patch_tools()
+        ctx = self.make_ctx('--fail')
+        self.addCleanup(ctx._file.close)
+        self.assertEqual(jobs.InstallJob(ctx, self.tmp / 'g.nup', self.tmp / 'game').run_inline().result, 'failed')
+        self.assertEqual((locks._files, locks._claims), ({}, {}))
+
+    def test_the_command_line_takes_the_folders_lock(self):
+        from launcher import cli
+        ctx = self.make_ctx('ok')
+        ctx._file.close()
+        root = ['--root', str(ctx.layout.root)]
+        ran = []
+
+        def run(a, ctx, held):
+            ran.append((a.cmd, held is not None and locks._key(ctx.layout.instance_lock) in locks._files))
+            ctx._file.close()
+            return 0
+        err = io.StringIO()
+        with mock.patch.object(cli, 'run', run), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(root + ['tools']), 0)
+            self.assertEqual(ran, [('tools', True)])                     # held while the command runs
+            self.assertEqual(locks._files, {})                           # and let go of after
+            other = self.holder(ctx.layout)
+            self.assertEqual(cli.main(root + ['rebuild']), 1)
+            self.assertEqual(cli.main(root + ['install', '--dump', 'd.nup', '--game', str(self.tmp / 'game')]), 1)
+            self.assertEqual(len(ran), 1)                                # neither ran, and no setting was written
+            self.assertEqual(cli.main(root + ['check']), 0)              # the update check changes nothing: it runs
+            self.assertEqual(ran[-1], ('check', False))
+        self.assertIn(f'error: the launcher window (process {other.pid}', err.getvalue())
+        self.assertIn('try again', err.getvalue())
+
+    def test_the_command_line_update_refuses_while_the_game_runs(self):
+        """`update` rebuilds the game after it switched versions: started while the game runs, it would leave the new
+        version with the old build. It refuses before it downloads anything, as the window's Updates row does."""
+        import argparse
+        from launcher import cli
+        ctx = mock.MagicMock()
+        ctx.settings = {'game_dir': str(self.tmp / 'game')}
+        err = io.StringIO()
+        with mock.patch('launcher.cli.build.game_running', return_value=True) as running, \
+                mock.patch('launcher.cli.jobs.CheckJob') as check, \
+                mock.patch('launcher.cli.jobs.UpdateDownloadJob') as download, contextlib.redirect_stderr(err):
+            self.assertEqual(cli.run(argparse.Namespace(cmd='update'), ctx, mock.MagicMock()), 1)
+        running.assert_called_once_with(str(self.tmp / 'game'))
+        check.assert_not_called()
+        download.assert_not_called()
+        self.assertIn('error: the game is running', err.getvalue())
+
 
 # ---------------------------------------------------------------- the icon
 
@@ -3834,6 +4439,47 @@ class SavesTest(unittest.TestCase):
         self.assertFalse(saves.game_running(self.game))
         self.assertTrue(os.access(exe, os.W_OK))
 
+    @unittest.skipUnless(os.name == 'nt', 'the running check is Windows only')
+    def test_only_a_sharing_violation_is_a_running_game(self):
+        """A running exe refuses a write open with a sharing violation (32); access denied (5) on an exe that is not
+        read-only (an access list, Controlled Folder Access) is no running game, and is logged when asked."""
+        exe = self.game / 'ocarina.exe'
+        exe.write_bytes(b'MZ')
+        answers = []
+        with mock.patch('launcher.build._write_open_error', side_effect=lambda p: answers.pop(0)) as opened:
+            answers[:] = [32]
+            self.assertTrue(build.game_running(self.game))
+            answers[:] = [0]
+            self.assertFalse(build.game_running(self.game))
+            answers[:] = [5]
+            lines = []
+            self.assertFalse(build.game_running(self.game, log=lines.append))
+            self.assertEqual(len(lines), 1)
+            self.assertIn('cannot be opened for writing (access denied)', lines[0])
+            self.assertEqual(opened.call_count, 3)
+            os.chmod(exe, stat.S_IREAD)                    # read-only: cleared, then the open is tried again
+            answers[:] = [5, 32]
+            self.assertTrue(build.game_running(self.game))
+            self.assertTrue(os.access(exe, os.W_OK))
+            os.chmod(exe, stat.S_IREAD)
+            answers[:] = [5, 5]
+            lines = []
+            self.assertFalse(build.game_running(self.game, log=lines.append))
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(answers, [])
+        self.assertEqual(build._write_open_error(exe), 0)   # the real call on a file nothing holds
+        sleeper = self.game / 'sleeper.exe'                 # and on a running exe
+        if not compiled_sleeper(sleeper, 3000, 0):
+            self.skipTest('needs a C compiler')
+        proc = winsys.start_game(sleeper)
+        try:
+            self.assertEqual(build._write_open_error(sleeper), build.ERROR_SHARING_VIOLATION)
+            self.assertTrue(build.game_running(self.game, exe='sleeper.exe'))
+        finally:
+            proc.kill()
+            proc.wait(10)
+        self.assertFalse(build.game_running(self.game, exe='sleeper.exe'))
+
     def test_read_only_files_import_writable(self):
         acct = saves.account_dir(self.game)
         self.files(acct, {'save.dat': b'old'})
@@ -3864,6 +4510,63 @@ class SavesTest(unittest.TestCase):
         with self.assertRaises(saves.SaveError):
             saves.import_save(self.game, big, log=lambda m: None)
         self.assertEqual((acct / 'save.dat').read_bytes(), b'1')      # nothing changed
+
+    @staticmethod
+    def game_lock(path):
+        """The profile lock as the game takes it (runtime/platform plat_lock_file): Windows opens the file without
+        sharing, elsewhere flock. Returns a function that lets go of it, or None when it is refused."""
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.WinDLL('kernel32', use_last_error=True)
+            k.CreateFileW.restype = wintypes.HANDLE
+            k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                      wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            h = k.CreateFileW(str(path), 0xC0000000, 0, None, 4, 0x80, None)
+            if h in (None, wintypes.HANDLE(-1).value):
+                return None
+            return lambda: k.CloseHandle(h)
+        import fcntl
+        f = open(path, 'a+b')
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            return None
+        return f.close
+
+    def test_no_import_while_the_game_holds_its_profile(self):
+        """The import takes the game's own profile lock for the time it replaces the save: a running game refuses
+        it with nothing changed, and a game that starts in the middle of an import is turned away by the lock
+        instead of mounting a save that is half replaced."""
+        acct = saves.account_dir(self.game)
+        self.files(acct, {'save.dat': b'old'})
+        src = self.files(self.tmp / 'theirs', {'save.dat': b'new'})
+        lock = self.game / 'profile' / 'instance.lock'
+        let_go = self.game_lock(lock)                                  # the game runs
+        self.assertIsNotNone(let_go)
+        with self.assertRaises(saves.SaveError) as refused:
+            saves.import_save(self.game, src, log=lambda m: None)
+        self.assertIn('the game is running', str(refused.exception))
+        self.assertEqual((acct / 'save.dat').read_bytes(), b'old')
+        self.assertFalse(saves.saves_dir(self.game).exists())          # no backup was made, nothing staged
+        self.assertFalse((self.game / 'profile' / 'save-tx' / 'import').exists())
+        let_go()                                                       # the game has ended
+        started = []
+        real_copytree = shutil.copytree
+
+        def copytree(a, b, *args, **kw):                               # the game is started during the backup's copy
+            started.append(self.game_lock(lock))
+            return real_copytree(a, b, *args, **kw)
+        with mock.patch.object(shutil, 'copytree', copytree):
+            r = saves.import_save(self.game, src, log=lambda m: None)
+        self.assertEqual(started, [None])                              # and is turned away
+        self.assertEqual((acct / 'save.dat').read_bytes(), b'new')
+        self.assertEqual((r['backup'] / 'save.dat').read_bytes(), b'old')
+        let_go = self.game_lock(lock)                                  # after the import the game starts as ever
+        self.assertIsNotNone(let_go)
+        let_go()
 
 
 class SaveShareTest(unittest.TestCase):
@@ -3943,8 +4646,8 @@ class SaveShareTest(unittest.TestCase):
         self.assertEqual(len([n for n in names if n.startswith('save/')]), len(self.SAVE))
 
     def test_a_bug_report_keeps_the_private_settings_values_out(self):
-        """A co-op room's secret, the relay and the player's name are not in the nx2navi.ini a bug report carries;
-        every other byte of the file is."""
+        """The private settings' values (a room's secret, a relay and a name that an earlier version's co-op left in
+        the file) are not in the nx2navi.ini a bug report carries; every other byte of the file is."""
         ini = (b'\xef\xbb\xbf[coop]\r\ncoop = 1\r\n  Coop_Room = H7K3WM-BCDFGH-234567\r\ncoop_server=relay.example:24680\r\n'
                b'# coop_name = in a comment\r\ncoop_name =\r\ncoop_accept = 1a2b3c4d\nfps_limit = 60')
         self.game_with_save(self.game, self.SAVE)
@@ -4507,37 +5210,314 @@ class SteamTest(Tmp):
 class WhilePlayingTest(Tmp):
     def test_the_games_restart_does_not_bring_the_launcher_back(self):
         try:
-            from launcher.ui.app import App
+            from launcher.ui import app
         except ImportError as e:
             self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
         a = mock.MagicMock()
         a.settings = {'game_dir': str(self.tmp)}
-        a.game_proc = mock.MagicMock(returncode=0)
-        a.game_proc.poll.return_value = 0                              # the process started here has ended
-        with mock.patch('launcher.ui.app.saves.game_running', return_value=True):
+        a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time())
+        a.game_run.proc.poll.return_value = 0                         # the process started here has ended
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                mock.patch('launcher.ui.app.winsys.game_copy', return_value=None) as copy:
             App.watch_game(a)                                          # but the restarted game runs from the same exe
+        copy.assert_called_once_with(self.tmp / 'ocarina.exe', skip=11)
         a.root.deiconify.assert_not_called()
         a.root.after.assert_called_once()
         with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
             App.watch_game(a)
         a.root.deiconify.assert_called_once()
 
-    def ended(self, code, log_text):
-        """watch_game after the game ended with code, its log holding log_text; (the stand-in window, the log)."""
-        from launcher.ui.app import App
+    def test_the_restarted_copy_is_followed_for_its_exit_code(self):
+        """The game's Restart ends the process the launcher started with code 0 and starts the exe again: the launcher
+        follows that copy (winsys.game_copy) and reports the code it ends with, and its FATAL line."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir()
+        log.write_text('[host] gfx: window closed; restarting\n', encoding='utf-8')
+        a = mock.MagicMock()
+        a.message = ''
+        a.settings = {'game_dir': str(self.tmp)}
+        a.install_staged.return_value = False
+        a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time() - 60)
+        a.game_run.proc.poll.return_value = 0
+        copy = mock.MagicMock(returncode=None, pid=12, ended=False)
+        copy.poll.return_value = None
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                mock.patch('launcher.ui.app.winsys.game_copy', return_value=copy):
+            App.watch_game(a)                                          # the copy is found and followed
+            App.watch_game(a)                                          # it runs: no further look for one
+        self.assertIs(a.game_run.proc, copy)
+        a.root.deiconify.assert_not_called()
+        log.write_text('[host] boot\nFATAL: vk: the GPU device was lost (seen at: q). The run ends here\n',
+                       encoding='utf-8')                               # the copy's own log (main.c log_open)
+        copy.returncode = 72
+        copy.poll.return_value = 72
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
+            App.watch_game(a)
+        a.ctx.log.assert_called_once_with('the game ended with code 72 after restarting itself; its log says: FATAL: '
+                                          'vk: the GPU device was lost (seen at: q). The run ends here')
+        self.assertIn('(code 72): vk: the GPU device was lost', a.message)
+        self.assertIn('[launcher] the game ended with code 72 (the graphics device was lost',
+                      log.read_text(encoding='utf-8'))
+        self.assertIsNone(a.game_run)
+
+    def test_a_restarted_copy_that_could_not_be_followed_ends_with_its_code_unknown(self):
+        """A copy the launcher could not find (it ended before the next look): its code is not known, so neither
+        launcher.log nor the game's log says code 0, and its FATAL line is still shown."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir()
+
+        def run(text):
+            log.write_text(text, encoding='utf-8')
+            a = mock.MagicMock()
+            a.message = ''
+            a.settings = {'game_dir': str(self.tmp)}
+            a.install_staged.return_value = False
+            a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time() - 60)
+            a.game_run.proc.poll.return_value = 0
+            with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                    mock.patch('launcher.ui.app.winsys.game_copy', return_value=None):
+                App.watch_game(a)
+            with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
+                App.watch_game(a)
+            return a
+
+        a = run('[host] log: x\n[host] perf: the last line of play\n')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; the exit code of its last run is '
+                                          'not known')
+        self.assertEqual(a.message, '')
+        text = log.read_text(encoding='utf-8')
+        self.assertIn('[launcher] the game ended with code unknown (the game had restarted itself;', text)
+        self.assertNotIn('code 0', text)
+        a = run('[host] log: x\nFATAL: fs: another copy of the game is running\n')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; its log says: FATAL: fs: another '
+                                          'copy of the game is running')
+        self.assertIn("A copy started by the game's Restart ended with a fatal error: fs: another copy", a.message)
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))   # the FATAL line says it already
+
+    def test_the_games_settings_file_is_left_alone_while_it_runs(self):
+        """The game writes nx2navi.ini when a menu setting changes, so the launcher's Discord Status switch (the one
+        setting of that file the Settings screen has) changes nothing while the game runs and says why; the mods'
+        switches refuse the same way (switch_mod)."""
+        try:
+            from launcher.ui.app import App
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        game = self.tmp / 'game'
+        game.mkdir()
+        (game / 'nx2navi.ini').write_text('[discord]\ndiscord_rpc = 1\n', encoding='utf-8')
+        a = mock.MagicMock()
+        a.message = ''
+        a.game_busy.return_value = True
+        row = App.discord_row(a, str(game))
+        before = (game / 'nx2navi.ini').read_bytes()
+        row.on(False)
+        self.assertEqual((game / 'nx2navi.ini').read_bytes(), before)
+        self.assertTrue(row.get())                                     # the switch still shows what the file says
+        self.assertIn('Quit the game first', a.message)
+        a.game_busy.return_value = False
+        row.on(False)
+        self.assertEqual(gameini.get(game, 'discord_rpc'), '0')
+        self.assertFalse(row.get())
+        self.assertEqual(a.message, '')
+        a.game_busy.return_value = True                                # a mod's switch while the game runs
+        a.settings = {'game_dir': str(game)}
+        App.switch_mod(a, mock.Mock(), False)
+        self.assertEqual(gameini.get(game, 'MODS_DISABLED'), '')
+        self.assertIn('Quit the game first', a.mods_message)
+
+    def ended(self, code, log_text, started=None):
+        """watch_game after the game ended with code, its log holding log_text; started is the time Play started it,
+        a minute ago unless given; (the stand-in window, the log)."""
+        from launcher.ui.app import App, GameRun
         log = self.tmp / 'logs' / 'nx2navi.log'
         log.parent.mkdir(exist_ok=True)
         if log_text is not None:
             log.write_text(log_text, encoding='utf-8')
         a = mock.MagicMock()
+        a.message = ''
         a.settings = {'game_dir': str(self.tmp)}
         a.game_dir.return_value = str(self.tmp)
-        a.game_proc = mock.MagicMock(returncode=code)
-        a.game_proc.poll.return_value = code
+        proc = mock.MagicMock(returncode=code)
+        proc.poll.return_value = code
+        a.game_run = GameRun(proc, str(self.tmp), time.time() - 60 if started is None else started)
         a.install_staged.return_value = False
         with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
             App.watch_game(a)
         return a, log
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows processes')
+    def test_a_game_copy_is_found_by_its_exe_file(self):
+        """winsys.game_copy finds a running process by its image file, not by its name, and reads the code it ended
+        with after it ended. A sleeper compiled here stands in for the game, under a name that no game runner
+        watches."""
+        mine, other = self.tmp / 'mine' / 'sleeper.exe', self.tmp / 'other' / 'sleeper.exe'
+        if not compiled_sleeper(mine, 4000, 72):
+            self.skipTest('needs a C compiler')
+        other.parent.mkdir()
+        shutil.copy(mine, other)
+        proc = winsys.start_game(mine)
+        try:
+            copy = winsys.game_copy(mine)
+            self.assertIsNotNone(copy)
+            self.assertEqual(copy.pid, proc.pid)
+            self.assertIsNone(copy.poll())
+            self.assertIsNone(winsys.game_copy(mine, skip=proc.pid))
+            self.assertIsNone(winsys.game_copy(other))          # the same name in another folder: another install
+            upper = winsys.game_copy(Path(str(mine).upper()))   # Windows paths ignore case
+            self.assertEqual(upper.pid, proc.pid)
+            proc.wait(30)
+            self.assertEqual(upper.poll(), 72)
+            self.assertEqual(copy.poll(), 72)
+            self.assertTrue(copy.ended)
+            self.assertIsNone(copy.handle)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(10)
+
+    def test_a_lost_device_shows_the_games_fatal_line(self):
+        """Exit code 72 (runtime/vk_device.c vk_device_lost_check) follows a FATAL line as 70 and 71 do; when its
+        watchdog ended the run before that line, the code's own text says what happened."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        fatal = 'vk: the GPU device was lost (seen at: q). The run ends here'
+        a, log = self.ended(72, f'[host] x\nFATAL: {fatal}\n[host] fatal: memory commit: this process 9000 MB\n')
+        self.assertEqual(a.message, f'The game ended with a fatal error (code 72): {fatal}. Its log is '
+                                    'logs\\nx2navi.log in the game folder.')
+        a.ctx.log.assert_called_once_with(f'the game ended with code 72; its log says: FATAL: {fatal}')
+        self.assertIn('[launcher] the game ended with code 72 (the graphics device was lost',
+                      log.read_text(encoding='utf-8'))
+        self.assertTrue(app.exit_code_text(72).startswith('72 (the graphics device was lost'))
+        a, _ = self.ended(72, '[host] vk: device fault: none\n')
+        self.assertIn('The game ended with code 72 (the graphics device was lost', a.message)
+
+    def test_a_fatal_line_after_code_0_is_the_restarted_copys(self):
+        """No process of the game writes a FATAL line and exits with 0: after code 0 such a line is a copy's that the
+        game's Restart started and that ended before the launcher saw it, and the player is told. A log older than
+        the start is an earlier run's and tells nothing."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] x\nFATAL: vk: the GPU device was lost (seen at: x)\n')
+        self.assertEqual(a.message, "A copy started by the game's Restart ended with a fatal error: vk: the GPU device "
+                                    'was lost (seen at: x). Its log is logs\\nx2navi.log in the game folder.')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; its log says: FATAL: vk: the GPU '
+                                          'device was lost (seen at: x)')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+        old = time.time() - 3600
+        log.write_text('FATAL: an earlier run started without the launcher\n', encoding='utf-8')
+        os.utime(log, (old, old))
+        a, _ = self.ended(0, None, started=time.time())
+        self.assertEqual(a.message, '')
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+
+    def test_a_log_cut_at_its_cap_says_nothing_of_its_end(self):
+        """A log that reached its 64 MiB cap (runtime/main.c log_sink) wrote its end lines to stderr only: it is
+        not taken for a run without its own end."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] perf: x\n[host] log: the file reached 64 MiB, the rest of this run goes to '
+                               'stderr only\n')
+        self.assertIsNone(app.log_has_own_exit(self.tmp))
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+
+    def play_from_steam(self, code, log_text, lock_held=False):
+        """play_only (--play, the Steam shortcut) for a game that ends with code, its log then holding log_text, with
+        the launcher folder's lock held by another process when lock_held; (the context, the stand-in for tell, the
+        log). self.start_game is the stand-in for winsys.start_game."""
+        from launcher.ui import app
+        (self.tmp / 'ocarina.exe').write_bytes(b'MZ')
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir(exist_ok=True)
+        log.write_text(log_text, encoding='utf-8')
+        ctx = mock.MagicMock()
+        ctx.settings = {'game_dir': str(self.tmp)}
+        ctx.layout = self.layout
+        proc = mock.MagicMock(returncode=code, pid=5)
+        proc.poll.return_value = code
+        told = []
+
+        def tell(text):   # what the logs hold when the box comes, which waits for OK
+            told.append((text, log.read_text(encoding='utf-8'), list(ctx.log.call_args_list)))
+        held = mock.patch('launcher.ui.app.locks.FileLock', side_effect=locks.Busy('the launcher window is using x')) \
+            if lock_held else contextlib.nullcontext()
+        with mock.patch('launcher.ui.app.winsys.start_game', return_value=proc) as self.start_game, \
+                mock.patch('launcher.ui.app.saves.game_running', return_value=False), \
+                mock.patch('launcher.ui.app.mods.prepare', return_value=[]), \
+                mock.patch('launcher.ui.app.build.can_rebuild', return_value=False), \
+                mock.patch('launcher.ui.app.time.sleep'), \
+                mock.patch('launcher.ui.app.tell', side_effect=tell), held:
+            self.assertEqual(app.play_only(ctx), 0)
+        return ctx, told, log
+
+    def test_play_from_steam_waits_for_a_job_in_the_game_folder(self):
+        """The Steam shortcut does not start the game while the window or a command runs a job in the game folder
+        (another process holds the launcher folder's lock, and the job's marker is there): the game would be the build
+        the job replaces. A marker that a stopped launcher left, with the lock free, stops nothing, nor does the window
+        open without a job."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        marker = self.layout.data / jobs.MARKER
+        marker.write_text(json.dumps({'task': 'the rebuild of the game', 'kind': 'rebuild'}), encoding='utf-8')
+        ctx, told, _ = self.play_from_steam(0, '[host] x\n', lock_held=True)
+        self.start_game.assert_not_called()
+        self.assertEqual([t[0] for t in told],
+                         ['NX2navi is busy with the rebuild of the game. Start the game when it is done.'])
+        ctx.log.assert_called_once_with('play from Steam: not started: the launcher is busy with the rebuild of the '
+                                        'game')
+        self.assertTrue(marker.is_file())                              # the job's marker stays
+        ctx, told, _ = self.play_from_steam(0, '[host] gfx: window closed; exiting\n')
+        self.start_game.assert_called_once()                          # the lock is free: the marker is a leftover
+        self.assertEqual(told, [])
+        marker.unlink()
+        ctx, told, _ = self.play_from_steam(0, '[host] gfx: window closed; exiting\n', lock_held=True)
+        self.start_game.assert_called_once()                          # the window is open, with no job
+        self.assertEqual(told, [])
+
+    def test_an_end_of_a_game_started_from_steam_is_told(self):
+        """The Steam shortcut's game ends as Play's does: launcher.log and the game's log say how, and an end worth it
+        (a FATAL line, 70, 71 or 72, a Windows status) gets a message box, as no window shows it."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        ctx, told, log = self.play_from_steam(70, '[host] x\nFATAL: fs: another copy of the game is running\n')
+        self.assertEqual(len(told), 1)
+        text, game_log, calls = told[0]
+        self.assertEqual(text, 'The game ended with a fatal error (code 70): fs: another copy of the game is running. '
+                               'Its log is logs\\nx2navi.log in the game folder.')
+        self.assertIn('[launcher] the game ended with code 70', game_log)
+        self.assertIn(mock.call('play from Steam: the game ended with code 70; its log says: FATAL: fs: another copy '
+                                'of the game is running'), calls)
+        _, told, _ = self.play_from_steam(0xC0000005, '[host] x\n')
+        self.assertEqual([t[0] for t in told], ['The game ended with code 0xC0000005 (access violation). Its log is '
+                                                'logs\\nx2navi.log in the game folder.'])
+        ctx, told, log = self.play_from_steam(0, '[host] x\n[host] gfx: window closed; exiting\n')
+        self.assertEqual(told, [])
+        ctx.log.assert_called_with('play from Steam: the game ended with code 0')
+        ctx, told, log = self.play_from_steam(1, '[host] perf: the last line\n')   # Task Manager's End task
+        self.assertEqual(told, [])
+        ctx.log.assert_called_with('play from Steam: the game ended with code 1')
+        self.assertIn('[launcher] the game ended with code 1 at', log.read_text(encoding='utf-8'))
 
     def test_a_fatal_exit_shows_the_games_fatal_line(self):
         """Exit codes 70 and 71 follow a FATAL line in the game's log: the home screen and launcher.log name it."""
@@ -4569,6 +5549,30 @@ class WhilePlayingTest(Tmp):
         log.unlink()
         self.assertEqual(app.last_fatal(self.tmp), '')
         self.assertEqual(app.last_fatal(''), '')
+
+    def test_an_end_with_code_0_is_logged_and_noted_without_the_games_exit_line(self):
+        """A run ended with code 0 goes into launcher.log; when the game's log has no line of the game's own end (the
+        window's close, its ExitProcess, a FATAL line), the end is noted in that log too."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] log: x\n[host] gfx: window closed; exiting\n[host] perf: after it\n')
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+        a, log = self.ended(0, '[host] log: x\n[host] perf: frame 39660: the last line of play\n')
+        a.ctx.log.assert_called_once_with('the game ended with code 0, and its log has no line of its own end')
+        text = log.read_text(encoding='utf-8')
+        self.assertIn("[launcher] the game ended with code 0 (the log has no line of the game's own end", text)
+        self.assertIs(app.log_has_own_exit(self.tmp), False)   # the note ends the search for the next run
+        log.write_text('FATAL: x\n', encoding='utf-8')
+        self.assertIs(app.log_has_own_exit(self.tmp), True)
+        log.write_text('[host] guest ExitProcess at main+0x10; exiting\n', encoding='utf-8')
+        self.assertIs(app.log_has_own_exit(self.tmp), True)
+        log.unlink()
+        self.assertIsNone(app.log_has_own_exit(self.tmp))
+        a, _ = self.ended(0, None)   # no log: logged as an end with code 0, nothing noted
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
 
     def test_the_fatal_line_is_looked_for_in_the_logs_end(self):
         try:
@@ -4652,6 +5656,38 @@ class BeginInstallTest(Tmp):
             rows = {r.label: r for r in App.rows_first_run(a) if r.label}
         self.assertIn('31 GB free', rows['Install Folder'].desc[0])
         self.assertIn('(31 GB free)', rows['Begin Installation'].desc[0])
+
+    def test_a_game_folder_whose_path_is_too_long_is_refused_first(self):
+        """Windows and the build tools stop at 260 characters for a file's whole path, and the game folder's own
+        files need 128 below it: a deeper folder is refused at Begin Installation and by the install job with the
+        lengths, where the build stopped in the middle with a file "not found". No limit elsewhere."""
+        from launcher import paths
+        most = paths.WINDOWS_PATH_MAX - 1 - paths.LONGEST_IN_GAME
+        fits = 'C:\\' + 'g' * (most - 3)
+        deep = fits + 'g'
+        with mock.patch.object(paths.os, 'name', 'nt'), \
+                mock.patch.object(paths.os.path, 'abspath', lambda p: p):   # as Windows gives these paths back
+            self.assertEqual(paths.long_path_problem(fits), '')
+            self.assertEqual(paths.long_path_problem(''), '')
+            said = paths.long_path_problem(deep)
+            self.assertIn(f'is {most + 1} characters long', said)
+            self.assertIn(f'at most {most} characters', said)
+        with mock.patch.object(paths.os, 'name', 'posix'):
+            self.assertEqual(paths.long_path_problem('/' + 'g' * 4000), '')
+        if os.name != 'nt':
+            return
+        App, a = mock_app(self, deep)
+        a.settings['dump'] = str(self.tmp / 'game.nup')
+        a.game_dir.return_value = deep
+        App.begin_install(a)
+        a.run_job.assert_not_called()
+        self.assertTrue(a.message.startswith('The path of the game folder is'))
+        ctx = JobTest.make_ctx(self, 'ok')
+        self.addCleanup(ctx._file.close)
+        j = jobs.InstallJob(ctx, self.tmp / 'g.nup', deep).run_inline()
+        self.assertEqual(j.result, 'failed')
+        self.assertIn('characters long', j.error)
+        self.assertEqual(j.step('tools').state, jobs.PENDING)         # before the build tools are fetched
 
 
 class UpdateTextTest(Tmp):
@@ -4803,7 +5839,257 @@ class WindowTest(Tmp):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],
                            cwd=ROOT, capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('16 screens drawn', r.stdout)
+        self.assertIn('19 screens drawn', r.stdout)
+
+
+# ---------------------------------------------------------------- mods
+
+class ModsTest(Tmp):
+    """The mods folder as the launcher puts it in order for the game (launcher/mods.py) and the build takes its code
+    in (tools/make_game.py, tools/mod_files.py)."""
+
+    def setUp(self):
+        super().setUp()
+        from launcher import mods
+        self.mods = mods
+        self.game = self.tmp / 'game'
+        made_up_game(self.game)
+        self.folder = self.game / 'mods'
+        self.folder.mkdir()
+
+    def file(self, rel, text='x'):
+        p = self.folder / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    def tree(self):
+        return sorted(p.relative_to(self.folder).as_posix() for p in self.folder.rglob('*') if p.is_file())
+
+    def test_downloads_are_put_where_the_game_looks(self):
+        with zipfile.ZipFile(self.folder / 'Zipped.zip', 'w') as z:   # a zip holding the mod's own folder
+            z.writestr('Zipped/romfs/Actor/a.bfres', 'a')
+            z.writestr('Zipped/README.md', 'r')
+        with zipfile.ZipFile(self.folder / 'Escape.zip', 'w') as z:
+            z.writestr('../outside.txt', 'e')
+        self.file('Wrapped/readme.txt')                                # wrapped twice, a readme on each level
+        self.file('Wrapped/Wrapped v2/readme.txt')
+        self.file('Wrapped/Wrapped v2/Wrapped/romfs/UI/b.txt')
+        self.file('romfs/Actor/c.bfres')                               # a mod's romfs straight in the mods folder
+        self.file('atmosphere/contents/0400486024DEC000/romfs/d.txt')  # an Atmosphere layout: a mod as it is
+        self.file('Options/Option A/romfs/e')                           # a download with options: left alone
+        self.file('Options/Option B/romfs/e')
+        done = self.mods.prepare(self.game)
+        self.assertEqual(self.tree(), [
+            'Escape.zip', 'Options/Option A/romfs/e', 'Options/Option B/romfs/e', 'Unnamed mod/romfs/Actor/c.bfres',
+            'Wrapped/readme (2).txt', 'Wrapped/readme.txt', 'Wrapped/romfs/UI/b.txt', 'Zipped.zip',
+            'Zipped/README.md', 'Zipped/romfs/Actor/a.bfres',
+            'atmosphere/contents/0400486024DEC000/romfs/d.txt'])
+        self.assertFalse((self.game / 'outside.txt').exists())
+        self.assertTrue(any(line.startswith('Escape.zip was not unpacked') for line in done))
+        self.assertEqual(self.mods.prepare(self.game), [line for line in done if 'Escape.zip' in line])   # once
+        found = {m.name: m for m in self.mods.scan(self.game)}
+        self.assertEqual(sorted(n for n, m in found.items() if m.usable),
+                         ['Unnamed mod', 'Wrapped', 'Zipped', 'atmosphere'])
+        self.assertIn('options', found['Options'].problem)
+        self.assertEqual(found['Zipped'].files, ['actor/a.bfres'])
+
+    def test_what_the_game_cannot_use_is_named(self):
+        self.file('Plugin/exefs/subsdk9')
+        self.file('Other/atmosphere/contents/01007EF00011E000/romfs/x')
+        self.file('Readme only/readme.txt')
+        self.file('Old patch/exefs/0123456789ABCDEF0123456789ABCDEF.ips', 'PATCHEOF')
+        self.file('Patch/exefs/E0F3CCFAF50065AE4EA01EB5AEB13B1A.ips', 'PATCHEOF')
+        found = {m.name: m for m in self.mods.scan(self.game)}
+        self.assertIn('code module', found['Plugin'].problem)
+        self.assertIn('01007EF00011E000', found['Other'].problem)
+        self.assertIn('nothing the game reads', found['Readme only'].problem)
+        self.assertIn('another version', found['Old patch'].problem)
+        self.assertEqual((found['Patch'].problem, found['Patch'].patches), ('', 1))
+
+    def test_switches_and_order_are_the_games_settings(self):
+        for name in ('beta', 'Alpha', ' Lead'):
+            self.file(f'{name}/romfs/same.txt', name)
+        self.assertEqual([m.name for m in self.mods.scan(self.game)], [' Lead', 'Alpha', 'beta'])   # strcmp
+        self.mods.set_enabled(self.game, 'Alpha', False)
+        self.mods.move(self.game, 'beta', -2)
+        self.mods.set_enabled(self.game, ' Lead', False)
+        self.mods.set_enabled(self.game, 'Alpha', True)
+        self.assertEqual(gameini.get(self.game, 'MODS_ORDER'), 'beta| Lead|Alpha')
+        self.assertEqual(gameini.get(self.game, 'MODS_DISABLED'), ' Lead')
+        self.assertIn('mods_disabled = " Lead"', (self.game / 'nx2navi.ini').read_text())   # as runtime/cfg.c quotes
+        found = self.mods.scan(self.game)
+        self.assertEqual([(m.name, m.enabled) for m in found], [('beta', True), (' Lead', False), ('Alpha', True)])
+        self.assertEqual(self.mods.overlaps(found), {'beta': [('Alpha', 1, True)], 'Alpha': [('beta', 1, False)]})
+
+    def test_names_windows_cannot_keep_are_refused_in_an_archive(self):
+        """A file of a mod's archive called after a device (CON.pchtxt), ending in a dot or a space, or holding a
+        colon cannot be kept under its name on Windows: unpacked anyway it is lost, renamed or a hidden stream of
+        another file, and the game misses it without a word. The archive is refused with the file's name; on
+        Linux, whose game reads such names, it passes."""
+        problem = self.mods.windows_name_problem
+        for name in ('CON', 'con.pchtxt', 'NUL.tar.gz', 'Com1', 'LPT9.txt', 'aux .txt', 'trailing.', 'trailing ',
+                     'file.txt:stream', 'what?.bfres', 'tab\there'):
+            self.assertTrue(problem(name), name)
+        for name in ('console.txt', 'COM10.txt', 'a.b.c', '.hidden', 'nul_tex.bntx.zs', 'Actor', 'my mod (2)',
+                     'Ünïcödé'):
+            self.assertEqual(problem(name), '', name)
+        safe = self.mods._safe_members
+        safe(['romfs/Actor/a.bfres', 'romfs/Actor/', 'readme.txt'], windows=True)
+        for bad in ('exefs/CON.pchtxt', 'romfs/nul/a.txt', 'romfs/Actor/foo.', 'romfs/Actor /a.txt',
+                    'romfs/file.txt:stream', 'romfs\\AUX.bin'):
+            with self.assertRaises(self.mods.ModError) as refused:
+                safe(['romfs/ok.txt', bad], windows=True)
+            self.assertIn(f'({bad})', str(refused.exception))
+            safe(['romfs/ok.txt', bad], windows=False)                  # names as any other elsewhere
+        with self.assertRaises(self.mods.ModError):                     # leaving the folder is refused everywhere
+            safe(['../outside.txt'], windows=False)
+        with zipfile.ZipFile(self.folder / 'Device.zip', 'w') as z:
+            z.writestr('exefs/CON.pchtxt', '@stop\n')
+            z.writestr('romfs/a.txt', 'a')
+        done = self.mods.prepare(self.game)
+        if os.name == 'nt':
+            self.assertEqual(len(done), 1)
+            self.assertIn('Device.zip was not unpacked: it holds a file Windows cannot keep under its name '
+                          '(exefs/CON.pchtxt): Windows keeps that name for a device', done[0])
+            self.assertEqual(self.tree(), ['Device.zip'])                # nothing of it was unpacked
+            with self.assertRaises(self.mods.ModError):                 # Add a Mod refuses the same archive
+                self.mods.add(self.game, self.folder / 'Device.zip')
+            self.assertEqual(self.tree(), ['Device.zip'])
+        else:
+            self.assertEqual(self.tree(), ['Device.zip', 'Device/exefs/CON.pchtxt', 'Device/romfs/a.txt'])
+
+    def test_a_picked_archive_or_folder_is_added(self):
+        src = self.tmp / 'Downloads'
+        src.mkdir()
+        with zipfile.ZipFile(src / 'Picked.zip', 'w') as z:
+            z.writestr('romfs/a.txt', 'a')
+        (src / 'Folder Mod' / 'Inner' / 'exefs').mkdir(parents=True)
+        (src / 'Folder Mod' / 'Inner' / 'exefs' / 'E0F3CCFAF50065AE.ips').write_text('PATCHEOF')
+        (src / 'romfs').mkdir()
+        (src / 'romfs' / 'b.txt').write_text('b')
+        self.assertEqual(self.mods.add(self.game, src / 'Picked.zip').name, 'Picked')
+        self.assertEqual(self.mods.add(self.game, src / 'Picked.zip').name, 'Picked 2')
+        self.assertEqual(self.mods.add(self.game, src / 'Folder Mod').name, 'Folder Mod')
+        self.assertEqual(self.mods.add(self.game, src / 'romfs').name, 'Unnamed mod')
+        self.assertEqual(self.tree(), ['Folder Mod/exefs/E0F3CCFAF50065AE.ips', 'Picked 2/romfs/a.txt',
+                                       'Picked/romfs/a.txt', 'Unnamed mod/romfs/b.txt'])
+        self.assertTrue((src / 'Picked.zip').is_file())   # the player's download stays where it was
+        with self.assertRaises(self.mods.ModError):
+            self.mods.add(self.game, src / 'Folder Mod' / 'Inner' / 'exefs' / 'E0F3CCFAF50065AE.ips')
+        self.assertEqual(list(self.game.glob(self.mods.STAGING + '*')), [])   # nothing stays beside the mods folder
+
+    def test_a_mod_that_does_not_arrive_whole_leaves_nothing(self):
+        """A copy that stops halfway (a full disk, the launcher closed) or an archive that cannot be unpacked
+        leaves no folder in the mods folder, which the game would load as a mod, and none beside it."""
+        src = self.tmp / 'Downloads' / 'Big Mod'
+        (src / 'romfs').mkdir(parents=True)
+        for n in range(4):
+            (src / 'romfs' / f'{n}.txt').write_text('x')
+        self.file('Kept/romfs/k.txt')
+        real_copytree = shutil.copytree
+        for stop in (OSError(28, 'No space left on device'), KeyboardInterrupt()):
+            copied = []
+
+            def copy(a, b, stop=stop, copied=copied):
+                if len(copied) == 2:
+                    raise stop
+                copied.append(b)
+                return shutil.copy2(a, b)
+
+            def copytree(a, b, *args, copy=copy, **kw):   # shutil.copytree with a copy that stops at the third file
+                if args or kw:   # shutil's own call for a folder inside, which hands the copy on
+                    return real_copytree(a, b, *args, **kw)
+                return real_copytree(a, b, copy_function=copy)
+            with mock.patch.object(shutil, 'copytree', copytree), self.assertRaises(type(stop)):
+                self.mods.add(self.game, src)
+            self.assertEqual(len(copied), 2)                              # two files had arrived
+            self.assertEqual(self.tree(), ['Kept/romfs/k.txt'])
+            self.assertEqual(list(self.game.glob(self.mods.STAGING + '*')), [])
+        (src.parent / 'Broken.zip').write_bytes(b'PK\x03\x04 not a zip')
+        with self.assertRaises(self.mods.ModError):
+            self.mods.add(self.game, src.parent / 'Broken.zip')
+        self.assertEqual(self.tree(), ['Kept/romfs/k.txt'])
+        self.assertEqual([m.name for m in self.mods.scan(self.game)], ['Kept'])
+        self.assertEqual(self.mods.add(self.game, src).name, 'Big Mod')   # and the same mod goes in whole after
+        self.assertEqual(len(self.tree()), 5)
+
+    def test_a_mod_is_put_together_beside_the_mods_folder(self):
+        """While a mod is copied the mods folder does not hold it; it moves in under a name that is free then; and
+        what a stopped launcher left beside the mods folder long ago is removed."""
+        src = self.tmp / 'Downloads' / 'Late'
+        (src / 'romfs').mkdir(parents=True)
+        (src / 'romfs' / 'a.txt').write_text('a')
+        left = self.game / self.mods.STAGING
+        (left / 'mod' / 'romfs').mkdir(parents=True)
+        old = time.time() - 2 * self.mods.STAGING_STALE
+        os.utime(left, (old, old))
+        fresh = self.game / (self.mods.STAGING + ' 2')                    # another add still at work
+        fresh.mkdir()
+        seen = []
+        real_copytree = shutil.copytree
+
+        def copytree(a, b, *args, **kw):
+            if not seen:                                                  # the first call; shutil calls it per folder
+                seen.append((Path(b), self.tree()))
+                (self.folder / 'Late' / 'romfs').mkdir(parents=True)      # a folder of that name comes meanwhile
+            return real_copytree(a, b, *args, **kw)
+        with mock.patch.object(shutil, 'copytree', copytree):
+            target = self.mods.add(self.game, src)
+        self.assertEqual(seen[0][1], [])                                  # nothing in the mods folder while copying
+        self.assertEqual(seen[0][0].parent.parent, self.game)             # it was put together beside it
+        self.assertEqual(target.name, 'Late 2')
+        self.assertEqual(self.tree(), ['Late 2/romfs/a.txt'])            # the folder that came holds no file
+        self.assertFalse(left.exists())
+        self.assertEqual(list(self.game.glob(self.mods.STAGING + '*')), [fresh])
+
+    def test_code_waits_for_a_build_that_saw_it(self):
+        import make_game
+        cheat = self.file('Cheats/cheats/E0F3CCFAF50065AE.txt', '[Moon jump]\n04000000 00000000 D503201F\n')
+        self.file('Textures/romfs/a.txt')
+        self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])
+        self.mods.set_enabled(self.game, 'Cheats', False)
+        self.assertEqual(self.mods.code_waiting(self.game), [])          # a mod switched off waits for nothing
+        self.mods.set_enabled(self.game, 'Cheats', True)
+        (self.game / 'build-cache' / 'mod-code.json').write_text(json.dumps(make_game.mod_code(self.game)))
+        self.assertEqual(self.mods.code_waiting(self.game), [])          # the last build took it up
+        cheat.write_text('[Moon jump]\n04000000 00000000 D65F03C0\n')
+        self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])  # edited since
+
+    def test_code_cheats_take_mains_base_from_the_layout(self):
+        """recomp/layout.py alone decides the modules' bases: tools/cheats.py decodes main's pc-relative code at the
+        base the layout gives main, the first module of its order, and follows it when it changes."""
+        import importlib
+        import cheats
+        import layout
+        self.assertEqual(layout.ORDER[0], 'main')
+        self.assertEqual(cheats.BASE, layout.FIRST_BASE)
+        self.addCleanup(importlib.reload, cheats)
+        with mock.patch.object(layout, 'FIRST_BASE', 0x7100000000):
+            self.assertEqual(importlib.reload(cheats).BASE, 0x7100000000)
+
+    def test_the_mods_code_is_in_the_lift_key_and_not_the_shaders_key(self):
+        import make_game
+        kit = self.tmp / 'kit'
+        for d in ('tools', 'recomp', 'runtime', 'bin'):
+            (kit / d).mkdir(parents=True)
+        for f in ('tools/prepare_shaders.py', 'tools/cheats.py', 'tools/exefs_patches.py', 'tools/mod_files.py',
+                  'recomp/patches-v111.txt', 'bin/' + make_game.XLATE_NAME, 'bin/nx2navi_xlate.id', 'VERSION'):
+            (kit / f).write_text('1\n')
+
+        def keys():
+            return {s: make_game.step_key(s, 'game', self.game) for s in ('lift', 'compile', 'shaders')}
+        with mock.patch.object(make_game, 'KIT', kit):
+            plain = keys()
+            self.file('Textures/romfs/a.txt')
+            self.assertEqual(keys(), plain)                    # files of the game's data: no build
+            self.assertNotIn('|mods ', plain['lift'])
+            self.file('Patch/exefs/E0F3CCFAF50065AE.ips', 'PATCHEOF')
+            with_patch = keys()
+            self.assertTrue(with_patch['lift'].startswith(plain['lift'] + '|mods '))
+            self.assertNotEqual(with_patch['compile'], plain['compile'])
+            self.assertEqual(with_patch['shaders'], plain['shaders'])
+            self.assertEqual(list(make_game.mod_code(self.game)), ['Patch/exefs/E0F3CCFAF50065AE.ips'])
 
 
 if __name__ == '__main__':

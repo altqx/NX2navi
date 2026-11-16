@@ -66,6 +66,8 @@ int fs_save_busy(void);                                    // a save is being wr
                                                            // or save data changed in the last 3 s and not committed
 void fs_save_flush(void);                                  // wait for a save Commit still running in the background;
                                                            // every exit path calls it before the process ends
+void fs_save_wait(void);                                   // wait for a save Commit under way, refusing none later
+                                                           // (the orderly end's first step, gfx_present.c rt_exit_steps)
 // A shared save (save_share.c). fs_save_export: visit(ctx, path below the save with '/', bytes, size) for every file of
 // the save the game would load next, under the commit lock; visit returns 0 to fail. The number of files (0: no save
 // yet), -1 when one could not be read or visit failed.
@@ -81,10 +83,7 @@ const char *fs_save_import_done(void);                     // the backup of the 
                                                            // "-" when there was none, "" when no import ran
 // A copy of the newest committed save (every slot) in <profile>/<folder>/<UTC time>/, flushed, taken while no Commit
 // runs; the newest keep copies stay. prefix (NULL: none) goes before the time, and a copy whose name it begins is
-// never pruned: the copy from before a co-op room, say, outlasts the ones made later. 1 and the copy's path in out
+// never pruned, so a first copy outlasts the ones made later. 1 and the copy's path in out
 // (empty when nothing is saved yet: nothing to copy), 0 when it could not be made (logged). Slow (the whole save): not
 // on the game's thread.
 int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap);
-// <profile>/rel into out: a file of the profile folder beside the saves (the co-op maker's room keys). 0 when there is
-// no profile folder or the path does not fit.
-int fs_profile_path(const char *rel, char *out, size_t cap);

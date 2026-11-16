@@ -25,6 +25,7 @@ rows, a new screen slides in, sparks drift over the backdrop and Navi bobs in th
 plays the game's own decide and cancel sounds, read from the player's game, for a choice and for going back.
 """
 import argparse
+import collections
 import colorsys
 import math
 import os
@@ -37,8 +38,9 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, steam, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, locks, mods, saves, steam, versions, winsys
 from ..context import Context
+from ..paths import long_path_problem
 from . import art, picture, sound
 
 W, H = 1000, 640
@@ -54,7 +56,9 @@ P = art.PALETTE                 # the colour scheme in use: art.set_theme change
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
 DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
-         'color': 2}
+         'color': 2, 'mods': 1, 'mod_order': 2}
+MODS_PAGE = 7     # mods on a page of the Mods screen, beside its other rows
+ORDER_PAGE = 10   # ... of the Load Order screen
 # the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
 # the hue bar (x0, y0, x1, y1)
 PICKER_BOX = (614, 100, 336, 452)
@@ -112,14 +116,19 @@ def free_gb(path):
         return 0.0
 
 
-# Exit codes that end the game, and what they mean. The game exits with 70 after a FATAL line of its own: an error it
-# cannot go on from, most often an allocation that failed because the memory ran out (runtime/dispatch.c rt_fatal), or
-# a failed re-run of itself (runtime/platform/win32.c plat_reexec). Its crash report exits with 71 after writing its
-# FATAL lines (runtime/main.c crash_handler). The others come from Windows when something ends the process before or
+# Exit codes that end the game, and what they mean. The game exits with 70 (runtime/dispatch.h RT_FATAL_EXIT) after a
+# FATAL line of its own: an error it cannot go on from, most often an allocation that failed because the memory ran
+# out (runtime/dispatch.c rt_fatal), or a failed re-run of itself (runtime/platform/win32.c plat_reexec). Its crash
+# report exits with 71 after writing its FATAL lines (runtime/main.c crash_handler). A lost graphics device ends it
+# with 72 (runtime/dispatch.h RT_LOST_EXIT, runtime/vk_device.c vk_device_lost_check), after a FATAL line too, unless
+# the report before that line hangs: then its watchdog (vk_device.c lost_wait_exit) ends the run with 72 and no FATAL
+# line, so 72's text stands without one. The others come from Windows when something ends the process before or
 # around that report.
 EXIT_CODES = {
     70: 'a fatal error: the FATAL line near the end of its log says which, often memory that ran out',
     71: 'the crash report ended the game',
+    72: 'the graphics device was lost: the GPU or its driver stopped, and the vk: lines near the end of its log say '
+        'what it was doing; a graphics driver update may help',
     0xC0000005: 'access violation',
     0xC00000FD: 'stack overflow',
     0xC0000142: 'a DLL failed to start',
@@ -129,6 +138,7 @@ EXIT_CODES = {
     0xC000041D: 'a fault inside a Windows callback',
     0xE06D7363: 'a C++ exception no one caught',
 }
+FATAL_CODES = (70, 71, 72)   # the codes that follow a FATAL line of the game's own (EXIT_CODES' comment)
 
 
 def exit_code_text(code):
@@ -145,9 +155,10 @@ FATAL_SHOWN = 240        # characters of a FATAL line the home screen shows; the
 
 def last_fatal(game_dir):
     """The last FATAL line of the game's latest run, without its "FATAL: ", or ''. The game writes one before it
-    exits with 70 (runtime/dispatch.c rt_fatal) or 71 (runtime/main.c crash_handler) into logs/nx2navi.log, which
-    each run starts anew (runtime/main.c log_open). A line this launcher added for an earlier run's end
-    (note_exit_in_log) ends the search: what stands before it is not this run's."""
+    exits with 70 (runtime/dispatch.c rt_fatal), 71 (runtime/main.c crash_handler) or 72 (runtime/vk_device.c
+    vk_device_lost_check) into logs/nx2navi.log, which each run starts anew (runtime/main.c log_open). A line this
+    launcher added for an earlier run's end (note_exit_in_log) ends the search: what stands before it is not this
+    run's."""
     if not game_dir:
         return ''
     try:
@@ -164,6 +175,38 @@ def last_fatal(game_dir):
     return ''
 
 
+# The lines the game writes when it ends on its own: the window's close (runtime/gfx_present.c gfx_window_closed), the
+# game's own exit (runtime/svc.c, ExitProcess), a timed run's end (runtime/boot.c), a fatal error and the crash report's
+# line for a fault on the way out (runtime/main.c).
+OWN_EXIT_LINES = ('gfx: window closed', 'guest ExitProcess', 'boot: frames', 'FATAL: ', 'exit: ')
+# The line a log stops with once it reached its size cap (runtime/main.c log_sink, LOG_CAP): the rest of that run,
+# its end lines too, went to stderr only.
+LOG_CUT_LINE = 'log: the file reached 64 MiB'
+
+
+def log_has_own_exit(game_dir):
+    """Whether the end of logs/nx2navi.log holds a line of the game's own end (OWN_EXIT_LINES) for its latest run; None
+    when the log cannot be read, or when it was cut at its size cap (LOG_CUT_LINE) and so cannot tell. A line this
+    launcher added for an earlier run's end (note_exit_in_log) ends the search."""
+    if not game_dir:
+        return None
+    try:
+        with open(Path(game_dir) / 'logs' / 'nx2navi.log', 'rb') as f:
+            f.seek(max(0, f.seek(0, 2) - FATAL_TAIL))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.startswith('[launcher] the game ended'):
+            return False
+        body = line.split('] ', 1)[1] if line.startswith('[') and '] ' in line else line
+        if body.startswith(OWN_EXIT_LINES):
+            return True
+        if body.startswith(LOG_CUT_LINE):
+            return None
+    return False
+
+
 def note_exit_in_log(game_dir, text):
     """Adds the exit code to the end of the game's log, so a log a player sends shows how the run ended even when the
     process died before it could write a line itself."""
@@ -175,6 +218,104 @@ def note_exit_in_log(game_dir, text):
             f.write(f'[launcher] the game ended with code {text} at {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
     except OSError:
         pass
+
+
+def log_is_new(game_dir, started):
+    """Whether logs/nx2navi.log was written at or after started (time.time() before the game was started). A run that
+    ends before it moves and opens its log (runtime/main.c log_open) leaves the log of a run before it in place. FAT
+    and exFAT drives keep a file's time to 2 s, hence the slack."""
+    if not game_dir or started is None:
+        return False
+    try:
+        return (Path(game_dir) / 'logs' / 'nx2navi.log').stat().st_mtime >= started - 2
+    except OSError:
+        return False
+
+
+LOG_WHERE = 'Its log is logs\\nx2navi.log in the game folder.'
+GameEnd = collections.namedtuple('GameEnd', 'log message note alarm')
+
+
+def shown_fatal(fatal):
+    return fatal if len(fatal) <= FATAL_SHOWN else fatal[:FATAL_SHOWN].rstrip() + '…'
+
+
+def game_end(game_dir, code, started=None, restarted=False):
+    """What the launcher says about an end of the game (App.watch_game, play_only): a GameEnd of the line for
+    launcher.log, the sentence for the player ('' for none), the text note_exit_in_log adds to the game's log ('' for
+    none), and alarm: whether the end is worth a message box where no window shows the sentence (a FATAL line, a code
+    of FATAL_CODES or a Windows status; not 0, nor 1, which Task Manager's End task gives). code is the exit code of
+    the run's last process, or None when it is not known, which happens only for a copy the game's own Restart started
+    that could not be followed (GameRun). started is time.time() before the game was started, restarted whether it
+    restarted itself on the way."""
+    how = ' after restarting itself' if restarted else ''
+    if code not in (0, None):
+        code &= 0xFFFFFFFF
+        text = exit_code_text(code)
+        # 70, 71 and 72 follow a FATAL line of the game's own, which names the error: the player gets that line and the
+        # launcher's log too, where the exit code alone said only that there was one
+        fatal = last_fatal(game_dir) if code in FATAL_CODES else ''
+        if fatal:
+            return GameEnd(f'the game ended with code {code}{how}; its log says: FATAL: {fatal}',
+                           f'The game ended with a fatal error (code {code}): {shown_fatal(fatal)}. {LOG_WHERE}',
+                           text, True)
+        return GameEnd(f'the game ended with code {text}{how}', f'The game ended with code {text}. {LOG_WHERE}', text,
+                       code in FATAL_CODES or code >= 0x80000000)
+    # No process of the game writes a FATAL line and exits with 0 (runtime/dispatch.c fatal_end, runtime/main.c
+    # crash_handler). After code 0, or a code not known, a FATAL line in a log written since the start is a copy's that
+    # the game's own Restart started (runtime/gfx_present.c gfx_window_closed): one that ended before the launcher saw
+    # it run, or one it could not follow. That copy's log is logs/nx2navi.log and holds the line already: no note.
+    fatal = last_fatal(game_dir) if log_is_new(game_dir, started) else ''
+    if fatal:
+        return GameEnd(f'the game ended after restarting itself; its log says: FATAL: {fatal}',
+                       f"A copy started by the game's Restart ended with a fatal error: {shown_fatal(fatal)}. "
+                       f'{LOG_WHERE}', '', True)
+    # Every end of a run the launcher started is logged, and when the game's log has no line of its own end, the end
+    # goes into that log: a session of 2026-11-13 stopped in play with code 0, no FATAL line and none of the game's exit
+    # lines, and nothing said how it had ended.
+    own = log_has_own_exit(game_dir)
+    if code is None:
+        return GameEnd('the game ended after restarting itself; the exit code of its last run is not known', '',
+                       "unknown (the game had restarted itself; the log has no line of the game's own end before "
+                       'this one)' if own is False else '', False)
+    if own is False:
+        return GameEnd(f'the game ended with code 0{how}, and its log has no line of its own end', '',
+                       "0 (the log has no line of the game's own end before this one)", False)
+    return GameEnd(f'the game ended with code 0{how}', '', '', False)
+
+
+class GameRun:
+    """A Play of the game, followed through the copies its own Restart starts. The Restart (runtime/gfx_present.c
+    gfx_window_closed) starts the exe again (runtime/platform/win32.c plat_restart) and ends the process before it
+    with code 0, so the code the game really ended with is its last copy's: once the process followed has ended with
+    0 while the exe still runs, the copy is looked for (winsys.game_copy) and followed from then on. proc is the
+    process followed, None once a copy could not be found (it ended before the next look, or the system did not show
+    it); the end's code is then not known. started is time.time() before the start (game_end's log_is_new)."""
+
+    def __init__(self, proc, game_dir, started):
+        self.proc, self.game_dir, self.started, self.restarted = proc, game_dir, started, False
+
+    def alive(self):
+        """Whether the process followed runs; nothing else is looked at. A winsys.GameCopy whose exit code could not
+        be read has ended all the same."""
+        return self.proc is not None and self.proc.poll() is None and getattr(self.proc, 'ended', False) is not True
+
+    def running(self):
+        """Whether the game still runs, this launcher's process or another of the same exe (build.game_running);
+        asked once a second until it says False."""
+        if self.alive():
+            return True
+        if not (self.game_dir and saves.game_running(self.game_dir)):
+            return False
+        if self.proc is not None and self.proc.returncode == 0:
+            self.restarted = True
+            self.proc = winsys.game_copy(Path(self.game_dir) / 'ocarina.exe', skip=self.proc.pid)
+        return True
+
+    def end(self):
+        """game_end for this run, once running() said False."""
+        return game_end(self.game_dir, None if self.proc is None else self.proc.returncode, self.started,
+                        self.restarted)
 
 
 def partial_image_gb(game_dir):
@@ -241,6 +382,9 @@ class App:
         self.save_message = ''   # the last import's result, shown in the import rows' descriptions
         self.export_message = ''   # the last Export Save result, shown in its description
         self.steam_message = ''   # the last Add to Steam result, shown in its description
+        self.mods_message = ''   # what the last change on the Mods screen did, shown in its descriptions
+        self.mods_page = 0       # the page of the Mods and Load Order screens
+        self.mods_failed = []    # the mods whose code a build before Play could not take in: Play no longer waits
         self.steam_busy = False   # Add to Steam is making the pictures or writing Steam's files
         self.pick = None   # the colour picker: {'slot', 'h', 's', 'v'} (HSV in 0..1) of the colour being picked
         self.pick_drag = None   # 'square' or 'bar' while the mouse drags on the picker
@@ -249,7 +393,7 @@ class App:
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
-        self.game_proc = None
+        self.game_run = None   # the Play being followed (GameRun), until watch_game sees its end
         self.cursor_frames, self.cursor_k = [], 0
         self.last_second = 0
         self.gamepad = winsys.Gamepad()
@@ -620,7 +764,7 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order'):
             self.sounds.play('back')
         if self.screen == 'color':
             self.pick_done()
@@ -630,6 +774,10 @@ class App:
             self.show('settings')
         elif self.screen == 'saves':
             self.show('home', self.home_row('Saves'))
+        elif self.screen == 'mods':
+            self.show('home', self.home_row('Mods'))
+        elif self.screen == 'mod_order':
+            self.show('mods', self.mods_back_focus())
         elif self.screen == 'customize':
             self.show('home', self.home_row('Customize Launcher'))
         elif self.screen == 'job' and self.job and self.job.result is None:
@@ -744,6 +892,13 @@ class App:
             self.ctx.log(f'the stub went back from {a.rolled_back} to {self.layout.version}')
             self.settings['rolled_back'] = versions.display(a.rolled_back)   # never installed again by itself
             self.settings.save()
+        if self.ctx.zstd_missing:   # told at once, not when Begin Installation stops at the build tools
+            self.message = self.ctx.zstd_missing
+        left = None if a.selftest else jobs.interrupted(self.ctx)   # before any job of this start leaves its own
+        if left:
+            self.ctx.log(f'the launcher was stopped during {left["task"]} (started '
+                         f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(left.get("started") or 0))}, game folder '
+                         f'{left.get("game_dir") or "none"})')
         for old in self.layout.root.glob('python.old*'):   # the Python an update replaced (launcher/native/nx2navi.c)
             shutil.rmtree(old, ignore_errors=True)
         if gd or self.settings.get('dump'):
@@ -760,11 +915,23 @@ class App:
             # build from before the update and Rebuild the Game finishes it, not the first-run screen and its dump
             self.show('home')
             self.after_update_notice()
+            if left and not self.message:
+                # make_game.py keeps the old exe until the new one is linked and records each finished step, so the
+                # game folder is playable and a rebuild goes on from there; the player is told that it is due
+                self.message = (f'NX2navi was closed or stopped during {left["task"]}, which did not finish. Play '
+                                'starts the last finished build; Rebuild the Game finishes what was left.')
+                self.render()
             if self.install_staged('a staged update waited for the launcher to start'):
+                return
+            if a.play:   # Play from Steam with a mod's code to build in first (play_only)
+                self.play()
                 return
             if self.settings.get('auto_check'):
                 self.check_now()
         else:
+            if left and not self.message:
+                self.message = (f'NX2navi was closed or stopped during {left["task"]}, which did not finish. Begin '
+                                'Installation goes on from the steps that were done.')
             self.show('first_run')
             self.find_dumps()
 
@@ -880,8 +1047,17 @@ class App:
         menu keeps it; the game reads it when it starts. On unless the file says 0, as the game reads it (cfg_bool,
         default on)."""
         def on(v):
+            # Not while the game runs, as the mods' switches (switch_mod): the game writes the same file when a menu
+            # setting changes. Each side reads the file, changes its own lines and puts a new file in place, so of
+            # two changes in the same moment the second drops the first. The game reads this setting only when it
+            # starts, and its own menu switches it meanwhile.
+            if self.game_busy(game_dir):
+                self.message = ('Quit the game first, or switch Discord Status in the game\'s menu (Game tab): the '
+                                'game writes its settings file while it runs.')
+                return
             try:
                 gameini.put(game_dir, 'discord', 'discord_rpc', '1' if v else '0')
+                self.message = ''
             except OSError as e:
                 self.message = f'The game\'s settings could not be written: {e}'
 
@@ -929,6 +1105,11 @@ class App:
             self.choose_dump()
             return
         gd = self.game_dir()
+        too_long = long_path_problem(gd)   # told here, not as a missing file halfway through the build
+        if too_long:
+            self.message = App.friendly(too_long)
+            self.render()
+            return
         drop_partial_image(gd)   # before the free space is measured
         if free_gb(gd) < 34 and not (Path(gd) / 'romfs' / 'romfs.bin').is_file():
             self.message = f'{drive_of(gd)} has {free_gb(gd):.0f} GB free; the game needs about 34 GB.'
@@ -997,6 +1178,7 @@ class App:
                 desc=('Open the game folder. The game keeps your save in its profile folder, its settings in '
                       'nx2navi.ini and its logs in logs. Its saves folder holds saves to import and backups.',)),
             self.saves_row(gd),
+            self.mods_row(gd),
             Row('value', 'Rebuild the Game', rebuild_value, rebuild_style, on=self.start_rebuild,
                 desc=('Build the game again from the files of the last build. Only what changed is compiled. Use it '
                       'after changing build tools, or if the game stopped starting.',)),
@@ -1486,7 +1668,7 @@ class App:
         gd = self.settings.get('game_dir')
         if not gd or not Path(gd).is_dir():
             self.save_message = 'Install the game first.'
-        elif (self.game_proc and self.game_proc.poll() is None) or saves.game_running(gd):
+        elif (self.game_run and self.game_run.alive()) or saves.game_running(gd):
             self.save_message = 'Quit the game first: it keeps its save open while it runs.'
         else:
             try:
@@ -1521,6 +1703,228 @@ class App:
         else:
             text = f'Save imported: {r["files"]} files from {r["source"].name}.'
         return text + (f' Your old save is in saves\\{r["backup"].name}.' if r['backup'] else '')
+
+    # ---- mods
+
+    def mod_list(self, gd, details=True):
+        """The game folder's mods in the game's load order ([] before the game is installed or when the folder cannot
+        be read)."""
+        if not gd or not Path(gd).is_dir():
+            return []
+        try:
+            return mods.scan(gd, details=details)
+        except OSError as e:
+            self.ctx.log(f'mods: {e}')
+            return []
+
+    def mods_row(self, gd):
+        """Mods: the screen of the game's mods; orange while a mod's code waits to be built into the game."""
+        found = self.mod_list(gd, details=False)
+        try:
+            waiting = mods.code_waiting(gd) if found else []
+        except OSError:
+            waiting = []
+        on = sum(1 for m in found if m.enabled)
+        desc = ('Mods change the game: its pictures, models, sounds, text or code. Put a mod you downloaded into the '
+                'mods folder, its .zip, .7z or .rar file as it is or its folder, or select Mods and then Add a Mod: '
+                'Play takes it in. Switch each mod on or off, and choose which wins where two change the same file.',)
+        if waiting:
+            desc += (f'{", ".join(waiting)} changes the game\'s code: Play first builds the game again with it, which '
+                     'takes a few minutes.',)
+        return Row('value', 'Mods', 'Build Waiting' if waiting else f'{on} On' if found else 'None',
+                   'orange_arrow' if waiting else 'arrow', on=lambda: self.show('mods'), desc=desc)
+
+    def mods_page_count(self, n, per):
+        return max(1, -(-n // per))
+
+    def rows_mods(self):
+        gd = self.settings.get('game_dir')
+        folder = mods.mods_dir(gd) if gd else Path('mods')
+        found = self.mod_list(gd)
+        over = mods.overlaps(found)
+        pages = self.mods_page_count(len(found), MODS_PAGE)
+        self.mods_page = max(0, min(pages - 1, self.mods_page))
+        msg = (self.mods_message,) if self.mods_message else ()
+        rows = [
+            Row('value', 'Open Mods Folder', str(folder), on=self.open_mods,
+                desc=msg + ('Open the mods folder: one folder for each mod. A mod you downloaded goes in as it came, '
+                            'an archive (.zip, .7z or .rar) or a folder; Play unpacks archives into folders of their '
+                            'own and moves a mod\'s files to where the game looks for them.',
+                            'To remove a mod, delete its folder and its archive, or switch it off here.')),
+            Row('value', 'Add a Mod', 'Choose a File', 'arrow', on=lambda: self.add_mod(folder=False),
+                desc=msg + ('Choose a mod you downloaded, a .zip, .7z or .rar file: it is unpacked into the mods '
+                            'folder, ready for the game\'s next start.',)),
+            Row('value', 'Add a Mod Folder', 'Choose a Folder', 'arrow', on=lambda: self.add_mod(folder=True),
+                desc=msg + ('Choose the folder of a mod (one with a romfs, exefs or cheats folder in it, or an '
+                            'atmosphere folder): it is copied into the mods folder.',)),
+        ]
+        if found:
+            rows.append(Row('divider'))
+        for m in found[self.mods_page * MODS_PAGE:(self.mods_page + 1) * MODS_PAGE]:
+            label = fit(self.f['label'], m.name, self.X(LABEL_W - 30))
+            if m.usable:
+                rows.append(Row('toggle', label, on=lambda v, m=m: self.switch_mod(m, v), get=lambda m=m: m.enabled,
+                                desc=lambda m=m: self.mod_desc(m, over)))
+            else:
+                rows.append(Row('value', label, 'Not Usable', 'salmon', on=lambda: None,
+                                desc=lambda m=m: self.mod_desc(m, over)))
+        if pages > 1:
+            rows.append(Row('enum', 'More Mods', get=lambda: f'Page {self.mods_page + 1} of {pages}',
+                            left=lambda: self.mods_turn(-1, 'mods'), right=lambda: self.mods_turn(1, 'mods'),
+                            desc=(f'{len(found)} mods, {MODS_PAGE} to a page: left and right turn the pages.',)))
+        if len(found) > 1:
+            rows.append(Row('value', 'Load Order', '', 'arrow', on=lambda: self.show('mod_order'),
+                            desc=('Where two mods change the same file, the one higher in the load order wins. Set '
+                                  'the order here.',)))
+        rows.append(Row('action', 'Back', on=lambda: self.show('home', self.home_row('Mods')), height=40,
+                        desc=('Back to the main menu.',)))
+        return rows
+
+    def mods_turn(self, d, screen):
+        self.mods_page += d
+        self.show(screen, next((i for i, r in enumerate(getattr(self, 'rows_' + screen)()) if r.label == 'More Mods'),
+                               None))
+
+    def mod_desc(self, m, over):
+        lines = [self.mods_message] if self.mods_message else []
+        if not m.usable:
+            lines.append(m.problem)
+        what = []
+        if m.files:
+            what.append(f'replaces {len(m.files):,} of the game\'s files' if len(m.files) > 1 else
+                        'replaces one of the game\'s files')
+        if m.patches:
+            what.append(f'patches the game\'s code ({m.patches} patch file{"s" if m.patches > 1 else ""})')
+        if m.cheat_file:
+            what.append('brings cheats, which the Cheats tab of the game\'s menu switches on and off')
+        if what:
+            lines.append('It ' + (', '.join(what[:-1]) + ' and ' + what[-1] if len(what) > 1 else what[0]) + '.')
+        if m.name == mods.STAND_INS:
+            lines.append('The launcher made it: stand-ins for game files its check found damaged, so that the game '
+                         'can load what needs them.')
+        if m.other_version:
+            lines.append(f'{m.other_version} of its code patch files are for another version of the game and are '
+                         'left out.')
+        for other, n, wins in over.get(m.name, [])[:3]:
+            lines.append(f'{n:,} of its files are in {other} too: {"this mod" if wins else other} wins, being higher '
+                         'in the load order.')
+        if m.waiting and m.enabled:
+            lines.append('Its code is not in the game yet: Play first builds the game again with it, which takes a '
+                         'few minutes.')
+        if m.usable:
+            lines.append('On: the game loads it at its next start. Off: it stays in the mods folder, unused.')
+        return {'title': m.name, 'text': lines}
+
+    def game_busy(self, gd):
+        return bool((self.game_run and self.game_run.alive()) or (gd and saves.game_running(gd)))
+
+    def switch_mod(self, m, on):
+        gd = self.settings.get('game_dir')
+        if self.game_busy(gd):
+            self.mods_message = 'Quit the game first: it reads the mods when it starts.'
+            return
+        try:
+            mods.set_enabled(gd, m.name, on)
+        except OSError as e:
+            self.mods_message = f'The game\'s settings file could not be written: {e}'
+            return
+        m.enabled, self.mods_message = bool(on), ''
+        self.ctx.log(f'mods: {m.name} {"on" if on else "off"}')
+
+    def open_mods(self):
+        gd = self.settings.get('game_dir')
+        if not gd or not Path(gd).is_dir():
+            self.mods_message = 'Install the game first.'
+            self.show('mods', self.focus)
+            return
+        try:
+            folder = mods.ensure_mods_dir(gd)
+        except OSError as e:
+            self.mods_message = f'The mods folder could not be made: {e}'
+            self.show('mods', self.focus)
+            return
+        self.open(folder)
+
+    def add_mod(self, folder):
+        gd = self.settings.get('game_dir')
+        if not gd or not Path(gd).is_dir():
+            self.mods_message = 'Install the game first.'
+        else:
+            if folder:
+                src = filedialog.askdirectory(parent=self.root, title='Choose the folder of the mod',
+                                              initialdir=str(Path.home() / 'Downloads'), mustexist=True)
+            else:
+                src = filedialog.askopenfilename(parent=self.root, title='Choose the mod',
+                                                 initialdir=str(Path.home() / 'Downloads'),
+                                                 filetypes=[('Mod', '*.zip *.7z *.rar'), ('All files', '*.*')])
+            if not src:
+                return
+            try:
+                target = mods.add(gd, src, log=self.ctx.log)
+            except (mods.ModError, OSError) as e:
+                self.mods_message = f'{Path(src).name} was not added: {e}.'
+            else:
+                added = next((m for m in self.mod_list(gd) if m.name == target.name), None)
+                self.mods_message = f'Added {target.name}.' + (f' {added.problem}' if added and not added.usable else
+                                                              ' It is on: the game loads it at its next start.')
+        self.show('mods', self.focus)
+
+    def rows_mod_order(self):
+        gd = self.settings.get('game_dir')
+        found = self.mod_list(gd, details=False)
+        pages = self.mods_page_count(len(found), ORDER_PAGE)
+        self.mods_page = max(0, min(pages - 1, self.mods_page))
+        rows = []
+        first = self.mods_page * ORDER_PAGE
+        for k, m in enumerate(found[first:first + ORDER_PAGE], first + 1):
+            rows.append(Row('enum', fit(self.f['label'], m.name, self.X(LABEL_W - 30)), get=lambda k=k: f'{k}',
+                            left=lambda m=m: self.order_move(m.name, -1), right=lambda m=m: self.order_move(m.name, 1),
+                            desc=lambda m=m, k=k: {'title': m.name, 'text': [
+                                f'Number {k} of {len(found)} in the load order{" (off)" if not m.enabled else ""}. '
+                                'Left moves it up: it wins over the mods below it where two change the same file. '
+                                'Right moves it down.'] + ([self.mods_message] if self.mods_message else [])}))
+        if pages > 1:
+            rows.append(Row('enum', 'More Mods', get=lambda: f'Page {self.mods_page + 1} of {pages}',
+                            left=lambda: self.mods_turn(-1, 'mod_order'), right=lambda: self.mods_turn(1, 'mod_order'),
+                            desc=(f'{len(found)} mods, {ORDER_PAGE} to a page: left and right turn the pages.',)))
+        rows.append(Row('action', 'Back', on=lambda: self.show('mods', self.mods_back_focus()), height=40,
+                        desc=('Back to the mods.',)))
+        return rows
+
+    def mods_back_focus(self):
+        return next((i for i, r in enumerate(self.rows_mods()) if r.label == 'Load Order'), None)
+
+    def order_move(self, name, d):
+        gd = self.settings.get('game_dir')
+        if self.game_busy(gd):
+            self.mods_message = 'Quit the game first: it reads the mods when it starts.'
+            return
+        try:
+            mods.move(gd, name, d)
+        except OSError as e:
+            self.mods_message = f'The game\'s settings file could not be written: {e}'
+            return
+        self.mods_message = ''
+        names = [m.name for m in self.mod_list(gd, details=False)]
+        at = names.index(name) if name in names else 0
+        self.mods_page = at // ORDER_PAGE
+        self.show('mod_order', at % ORDER_PAGE)
+
+    def mods_before_play(self, gd):
+        """Put the mods folder in order (mods.prepare) and say whether the game must be built again for a mod's code
+        first: the mods that wait for it, [] when none do."""
+        try:
+            for line in mods.prepare(gd, log=self.ctx.log):
+                self.mods_message = line
+                if 'was not unpacked' in line:   # on the home screen too, when the launcher comes back
+                    self.message = line
+        except OSError as e:
+            self.ctx.log(f'mods: the mods folder could not be put in order: {e}')
+        try:
+            return mods.code_waiting(gd) if build.can_rebuild(gd) else []
+        except OSError as e:
+            self.ctx.log(f'mods: {e}')
+            return []
 
     def update_desc(self):
         r = self.release
@@ -1598,21 +2002,36 @@ class App:
         if self.screen == 'home':
             self.show('home', self.focus)
 
-    def play(self):
+    def play(self, built=False):
+        """built: the build for the mods' code (ModsRebuildJob) just ended, so the game starts without asking again."""
         gd = self.settings.get('game_dir')
         exe = Path(gd) / 'ocarina.exe'
         if not exe.is_file():
             self.message = 'The game is not built yet.'
             self.render()
             return
-        if self.game_proc and self.game_proc.poll() is None:
+        if self.game_run and self.game_run.alive():
             return
         if saves.game_running(gd):   # a copy this launcher did not start (another launcher, a shortcut, a test run)
             self.message = 'The game is already running.'
             self.render()
             return
+        waiting = [] if built else self.mods_before_play(gd)
+        if waiting and waiting != self.mods_failed:
+            # a mod's code cheats or ExeFS patches the game was not built with: built in first (tools/make_game.py
+            # lift), then the game starts (job_finished). After a build that failed for the same mods the game
+            # starts without them, so that a build that cannot finish never keeps the player from the game.
+            self.ctx.log(f'play: the game is built again first for the code of {", ".join(waiting)}')
+            job = jobs.ModsRebuildJob(self.ctx, gd)
+            job.waiting = waiting
+            self.run_job(job, 'home')
+            self.message = f'Building the game with the code of {", ".join(waiting)}; it starts after.'
+            return
+        if waiting:
+            self.ctx.log(f'play: without the code of {", ".join(waiting)}, whose build did not finish')
+        started = time.time()
         try:
-            self.game_proc = winsys.start_game(exe)
+            self.game_run = GameRun(winsys.start_game(exe), gd, started)
         except OSError as e:
             self.message = f'The game could not start: {e}'
             self.render()
@@ -1624,29 +2043,23 @@ class App:
         self.root.after(1000, self.watch_game)
 
     def watch_game(self):
-        # The game's own Restart ends the process started here and starts another (gfx_present.c gfx_window_closed)
-        gd = self.settings.get('game_dir')
-        if (self.game_proc and self.game_proc.poll() is None) or (gd and saves.game_running(gd)):
+        """Once a second while the game Play started runs, its Restart's copies too (GameRun.running); then the window
+        comes back and the end goes into launcher.log, into the game's log when that has no line of it, and on home
+        when there is something to tell (game_end)."""
+        run = self.game_run
+        if run and run.running():
             self.root.after(1000, self.watch_game)
             return
-        code = self.game_proc.returncode if self.game_proc else 0
-        self.game_proc = None
+        self.game_run = None
         self.root.deiconify()
         self.root.lift()
-        if code not in (0, None):
-            text = exit_code_text(code)
-            # 70 and 71 follow a FATAL line of the game's own, which names the error: the player gets that line
-            # and the launcher's log too, where the exit code alone said only that there was one
-            fatal = last_fatal(self.game_dir()) if code & 0xFFFFFFFF in (70, 71) else ''
-            if fatal:
-                shown = fatal if len(fatal) <= FATAL_SHOWN else fatal[:FATAL_SHOWN].rstrip() + '…'
-                self.ctx.log(f'the game ended with code {code & 0xFFFFFFFF}; its log says: FATAL: {fatal}')
-                self.message = (f'The game ended with a fatal error (code {code & 0xFFFFFFFF}): {shown}. Its log is '
-                                'logs\\nx2navi.log in the game folder.')
-            else:
-                self.ctx.log(f'the game ended with code {text}')
-                self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
-            note_exit_in_log(self.game_dir(), text)
+        if run:
+            end = run.end()
+            self.ctx.log(end.log)
+            if end.note:
+                note_exit_in_log(run.game_dir, end.note)
+            if end.message:
+                self.message = end.message
         if self.install_staged('the game exited'):
             return
         self.show('home', self.focus)
@@ -1685,7 +2098,7 @@ class App:
         for the restart into it; True when it was installed."""
         if self.job and self.job.result is None:
             return False
-        running = bool(self.game_proc and self.game_proc.poll() is None)
+        running = bool(self.game_run and self.game_run.alive())
         ver = self.bg.install(self.settings.get('game_dir'), self.release, why, asked=asked, running=running)
         if not ver:
             return False
@@ -1708,7 +2121,7 @@ class App:
                 self.bg.asked = False
                 gd = self.settings.get('game_dir')
                 if (self.screen == 'home' and self.release and jobs.update_available(self.ctx, self.release)
-                        and not (self.game_proc and self.game_proc.poll() is None)
+                        and not (self.game_run and self.game_run.alive())
                         and not (gd and build.game_running(gd))):
                     self.run_job(jobs.UpdateDownloadJob(self.ctx, self.release), 'home')
                     return
@@ -1794,15 +2207,17 @@ class App:
     def rows_job(self):
         j = self.job
         rows = []
-        for st in j.steps:
-            if st.state == jobs.RUNNING:
-                rows.append(Row('progress', st.label, fraction=st.fraction, value=f'{int(st.fraction * 100)}%',
+        with j.locked():   # each step as one change of the worker left it, not a state with the value before it
+            steps = [(st.id, st.label, st.state, st.value, st.fraction) for st in j.steps]
+        for sid, label, state, value, fraction in steps:
+            if state == jobs.RUNNING:
+                rows.append(Row('progress', label, fraction=fraction, value=f'{int(fraction * 100)}%',
                                 focus_value=True, desc=None))
             else:
-                style = {jobs.DONE: 'normal', jobs.SKIPPED: 'dim', jobs.PENDING: 'dim', jobs.FAILED: 'salmon'}[st.state]
-                rows.append(Row('value', st.label, st.value, style, check=st.state == jobs.DONE, desc=None,
-                                focus_value=st.state == jobs.FAILED))
-            if st.id in ('romfs', 'verify') and st is not j.steps[-1]:
+                style = {jobs.DONE: 'normal', jobs.SKIPPED: 'dim', jobs.PENDING: 'dim', jobs.FAILED: 'salmon'}[state]
+                rows.append(Row('value', label, value, style, check=state == jobs.DONE, desc=None,
+                                focus_value=state == jobs.FAILED))
+            if sid in ('romfs', 'verify') and sid != steps[-1][0]:
                 rows.append(Row('divider'))
         if j.result is None:
             label = {'install': 'Cancel Installation', 'update': 'Cancel Update'}.get(j.kind, 'Cancel')
@@ -1825,7 +2240,7 @@ class App:
     def job_desc(self):
         j = self.job
         cur = j.current()
-        lines = [ln for ln in j.lines if ln.strip() and not ln.startswith('@@')][-6:]
+        lines = [ln for ln in j.last_lines(200) if ln.strip() and not ln.startswith('@@')][-6:]
         if j.result == 'failed':
             return {'title': 'The Build Stopped' if j.kind != 'update' or cur.id not in ('download', 'verify')
                     else 'The Update Stopped',
@@ -1885,7 +2300,7 @@ class App:
         j = self.job
         report = [f'NX2navi {self.layout.version} ({"checkout" if self.layout.dev else "release"}), {sys.platform}',
                   f'Job: {j.kind}, step: {j.current().label}', f'Error: {j.error}', '', 'Last lines:']
-        report += [ln for ln in list(j.lines)[-60:]]
+        report += j.last_lines(60)
         self.root.clipboard_clear()
         self.root.clipboard_append('\n'.join(report))
         self.message = 'Report copied.'
@@ -1914,6 +2329,14 @@ class App:
                 self.message = 'The update is ready: start NX2navi again to finish it.'
             elif j.after == 'staged':
                 self.message = 'The update was downloaded; a checkout keeps running from the repository.'
+            elif j.after == 'play':   # the mods' code is built in (play): the game starts
+                if not self.settings.get('keep_cache'):
+                    self.drop_build_cache()
+                self.message, self.mods_failed = '', []
+                self.show('home', self.home_row('Play'))
+                self.play(built=True)
+                return
+            self.mods_failed = []
             if not self.settings.get('keep_cache') and j.kind in ('install', 'update', 'rebuild'):
                 self.drop_build_cache()
             if j.kind == 'install':
@@ -1930,8 +2353,10 @@ class App:
             if j.kind == 'install' and self.settings.get('auto_check'):
                 self.check_now()
         elif j.result == 'cancelled':
+            self.mods_failed = getattr(j, 'waiting', self.mods_failed)
             self.show(self.job_back)
         else:
+            self.mods_failed = getattr(j, 'waiting', self.mods_failed)
             self.show('job')
 
     def drop_build_cache(self):
@@ -1985,7 +2410,7 @@ class App:
                 last = max(self.settings.get('last_check', 0.0), self.check_started)
                 if self.settings.get('auto_check') and time.time() - last >= jobs.RECHECK:
                     self.check_now()
-                if self.bg.waiting and not (self.game_proc and self.game_proc.poll() is None):
+                if self.bg.waiting and not (self.game_run and self.game_run.alive()):
                     self.install_staged('the game closed')
         except Exception as e:
             self.ctx.log(f'minute: {e!r}')
@@ -1994,14 +2419,16 @@ class App:
     def animate(self):
         """One step of everything that moves: the cursor on its way to the focused row and its breath, the screen
         sliding into place, the sparks and Navi. Each moves by the time since the last step (the timer comes when
-        Tk gets to it, 16 to 50 ms apart), at most a tenth of a second's worth. With Animations off, and while the
-        window is hidden or minimised (the game is running), nothing moves and the timer runs slowly."""
+        Tk gets to it, 16 to 50 ms apart), at most a tenth of a second's worth. With Animations off, while the
+        window is hidden or minimised, and while another window is in front, nothing moves and the timer runs slowly.
+        The last covers a launcher left open behind the game (Hide Launcher While Playing off): drawing every 15 ms
+        took about 0.6 of a CPU core from the game for a window nobody saw."""
         moving = False
         try:
             now = time.perf_counter()
             dt = min(0.1, max(0.0, now - self.anim_last))
             self.anim_last = now
-            moving = self.animated() and self.root.state() == 'normal'
+            moving = self.animated() and self.root.state() == 'normal' and winsys.in_front(self.root)
             if moving:
                 self.anim_t += dt
                 self.step_slide(dt)
@@ -2410,28 +2837,26 @@ def parse_args(argv):
 
 
 def single_instance(layout, wait):
-    """An exclusive lock on data/launcher.lock for this process's life, or None when another launcher holds it after
-    wait seconds (the one an update restart replaces may still be closing)."""
-    path = layout.data / 'launcher.lock'
-    deadline = time.time() + wait
-    while True:
-        try:
-            f = open(path, 'a+')
-            try:
-                if os.name == 'nt':
-                    import msvcrt
-                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return f
-            except OSError:
-                f.close()
-                raise
-        except OSError:
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.25)
+    """The launcher folder's lock (launcher/locks.py) for this window's life. locks.Busy, naming the holder, when
+    another launcher or a command of launcher/cli.py still holds it after wait seconds (the launcher an update
+    restart replaces may still be closing)."""
+    return locks.FileLock(layout.instance_lock, 'the launcher window', wait=wait, where=layout.root)
+
+
+def tell(text):
+    """A sentence for the player before the window is up: a message box that waits for OK."""
+    try:
+        if os.name == 'nt':
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, NAME, 0x40)
+        else:
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(NAME, text, parent=root)
+            root.destroy()
+    except Exception:   # no display, no toolkit: the terminal that started it
+        print(text, file=sys.stderr)
 
 
 def play_only(ctx):
@@ -2442,19 +2867,49 @@ def play_only(ctx):
     exe = Path(gd) / 'ocarina.exe' if gd else None
     if not exe or not exe.is_file():
         return None
+    # The window or a command may run a job in the game folder meanwhile (a rebuild, an update's install, the mods'
+    # build): the game started now would be the build that job is replacing, which then fails to replace it, and
+    # mods.prepare would unpack into the folder the job reads. Such a job holds the launcher folder's lock and leaves
+    # jobs.MARKER. The lock is only tried, and let go at once: held, it would keep the window from opening.
+    try:
+        locks.FileLock(ctx.layout.instance_lock, 'play from Steam', where=ctx.layout.root).release()
+    except locks.Busy:
+        job = jobs.running_job(ctx)
+        if job:
+            ctx.log(f'play from Steam: not started: the launcher is busy with {job["task"]}')
+            tell(f'NX2navi is busy with {job["task"]}. Start the game when it is done.')
+            return 0
     if saves.game_running(gd):
         ctx.log('play from Steam: the game is already running')
         return 0
     try:
-        proc = winsys.start_game(exe)
+        for line in mods.prepare(gd, log=ctx.log):
+            pass
+        waiting = mods.code_waiting(gd) if build.can_rebuild(gd) else []
+    except OSError as e:
+        ctx.log(f'play from Steam: mods: {e}')
+        waiting = []
+    if waiting:   # the window builds the mods' code in, then starts the game (App.start with --play)
+        ctx.log(f'play from Steam: the game is built again first for the code of {", ".join(waiting)}')
+        return None
+    started = time.time()
+    try:
+        run = GameRun(winsys.start_game(exe), gd, started)
     except OSError as e:
         ctx.log(f'play from Steam: {exe}: {e}')
         return None
     ctx.log(f'play from Steam: {exe}')
     time.sleep(2)
-    while proc.poll() is None or saves.game_running(gd):
+    while run.running():
         time.sleep(1)
-    ctx.log(f'play from Steam: the game ended (code {proc.returncode})')
+    # The end is told as Play's is (App.watch_game), with no window: a box for an end worth one. The logs come first,
+    # since the box waits for OK and Steam may end this process meanwhile.
+    end = run.end()
+    ctx.log(f'play from Steam: {end.log}')
+    if end.note:
+        note_exit_in_log(gd, end.note)
+    if end.alarm:
+        tell(end.message)
     return 0
 
 
@@ -2470,14 +2925,23 @@ def main(argv=None):
             return code
     lock = None
     if not a.selftest:
-        lock = single_instance(ctx.layout, 20 if (a.continue_update or a.rolled_back) else 2)
-        if lock is None:
-            ctx.log('another launcher is running')
+        try:
+            lock = single_instance(ctx.layout, 20 if (a.continue_update or a.rolled_back) else 2)
+        except locks.Busy as e:
+            # A second window on the same folder would run its own jobs into the same game folder and settings. The
+            # first one may be out of sight (hidden while the game runs), so the player is told who holds the folder
+            ctx.log(f'not started: {e}')
+            tell(f'NX2navi is already running: {e}.\n\nIts window may be hidden while the game runs; it comes back '
+                 'when you quit the game.')
             return 0
-    root = tk.Tk(className='NX2navi')
-    app = App(root, ctx, a)
-    if a.selftest:
-        from .selftest import run
-        root.after(300, lambda: run(app, a.shots))
-    root.mainloop()
+    try:
+        root = tk.Tk(className='NX2navi')
+        app = App(root, ctx, a)
+        if a.selftest:
+            from .selftest import run
+            root.after(300, lambda: run(app, a.shots))
+        root.mainloop()
+    finally:
+        if lock:
+            lock.release()
     return 0

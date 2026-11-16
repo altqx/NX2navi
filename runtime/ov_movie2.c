@@ -63,6 +63,11 @@ typedef struct {
     PlatCond conv;           // a decoded picture arrived, a slot freed, or quit
     Decoded cq[CQMAX];
     int cqh, cqn;
+    // The convert thread's deband planes (16-bit Y, U and V, plane_room samples of luma), kept from picture to picture
+    // and made again only for a larger one: made per picture they were 6.2 MB of fresh pages each at 1080p, 60 times a
+    // second. finalize frees them once the convert thread is joined.
+    uint16_t *y16, *u16, *v16;
+    size_t plane_room;
     Dav1dContext *dav1d;
     uint8_t in_ev[0x40], out_ev[0x40];   // nn::os::SystemEventType each
     int in_bound, out_bound;
@@ -82,6 +87,11 @@ typedef struct {
     int64_t ts0;
     uint64_t shown0_ns;
     int clock_on;
+    // The game fetches pictures ahead into a list of its own (main+0x3b61df0) and lets go of each when the next one
+    // takes its place on screen (ReleaseVideoFrame), so the distance to real time is measured there too: the newest
+    // released picture's, and how far it moved since the first released one (the drift), in ns
+    int64_t rel_lag, rel_lag0;
+    int rel_on;
 } Video;
 
 static Video *video_of(void *obj) { return obj ? *(Video **)obj : NULL; }
@@ -284,20 +294,64 @@ static void stripe_run(void *arg) {
         to_nv12(t);
     }
 }
+// The NSTRIPES - 1 helper threads are made once and kept. Made per call (two calls per picture, 30-60 pictures a
+// second) they were about 300 new threads a second for as long as a movie played, and every DLL in the process (the
+// GPU driver's, overlays and audio hooks) sets itself up for each new thread: a cost per thread, and with an AMD driver
+// on an RX 580 the process commit grew by about 300 MB a second during the title movie until the system ran out
+// (FATAL "movie: out of memory for a 1920x1080 frame" at 45.7 GB). One caller at a time (call_lock); a worker that
+// could not be started leaves its stripe to the caller.
+static struct {
+    PlatMutex call_lock;     // one run_stripes at a time (several decoders may exist)
+    PlatMutex lock;          // the fields below
+    PlatCond go, done;
+    Stripe job[NSTRIPES];
+    uint64_t gen;            // bumped per batch
+    int pending;             // helper stripes of the batch not finished
+    int nworkers;            // started helpers (stripes 1..nworkers); -1 not tried yet
+} SP = {PLAT_MUTEX_INIT, PLAT_MUTEX_INIT, PLAT_COND_INIT, PLAT_COND_INIT, {{0}}, 0, 0, -1};
+
+static void stripe_worker(void *arg) {
+    int i = (int)(intptr_t)arg;
+    uint64_t seen = 0;
+    plat_mutex_lock(&SP.lock);
+    for (;;) {
+        while (SP.gen == seen) plat_cond_wait(&SP.go, &SP.lock);
+        seen = SP.gen;
+        Stripe t = SP.job[i];
+        plat_mutex_unlock(&SP.lock);
+        stripe_run(&t);
+        plat_mutex_lock(&SP.lock);
+        if (!--SP.pending) plat_cond_broadcast(&SP.done);
+    }
+}
+
 static void run_stripes(Stripe base) {
-    Stripe st[NSTRIPES];
-    PlatThread *th[NSTRIPES] = {0};
+    plat_mutex_lock(&SP.call_lock);
+    if (SP.nworkers < 0) {
+        SP.nworkers = 0;
+        for (int i = 1; i < NSTRIPES; i++, SP.nworkers++)
+            if (!plat_thread_spawn(stripe_worker, (void *)(intptr_t)i, "movie convert", 0)) break;
+        if (SP.nworkers < NSTRIPES - 1) rt_log("movie: %d of %d convert threads started", SP.nworkers, NSTRIPES - 1);
+    }
     int rows = ((base.h + NSTRIPES - 1) / NSTRIPES + 1) & ~1;   // even: chroma rows split at the same places
+    Stripe st[NSTRIPES];
     for (int i = 0; i < NSTRIPES; i++) {
         st[i] = base;
         st[i].y0 = i * rows < base.h ? i * rows : base.h;
         st[i].y1 = (i + 1) * rows < base.h ? (i + 1) * rows : base.h;
-        if (i) th[i] = plat_thread_new(stripe_run, &st[i], "movie convert");
-        if (i && !th[i]) stripe_run(&st[i]);
     }
+    plat_mutex_lock(&SP.lock);
+    memcpy(SP.job, st, sizeof st);
+    SP.pending = SP.nworkers;
+    SP.gen++;
+    plat_cond_broadcast(&SP.go);
+    plat_mutex_unlock(&SP.lock);
     stripe_run(&st[0]);
-    for (int i = 1; i < NSTRIPES; i++)
-        if (th[i]) plat_thread_join(th[i]);
+    for (int i = SP.nworkers + 1; i < NSTRIPES; i++) stripe_run(&st[i]);   // helpers that could not start
+    plat_mutex_lock(&SP.lock);
+    while (SP.pending) plat_cond_wait(&SP.done, &SP.lock);
+    plat_mutex_unlock(&SP.lock);
+    plat_mutex_unlock(&SP.call_lock);
 }
 
 // Out of memory for a decoded frame: the frame is dropped (the game shows the previous one a little longer) and
@@ -308,8 +362,23 @@ static void movie_oom_log(int w, int h) {
     if (plat_xchg32(&drops, 1) == 0) rt_log("movie: out of memory for a %dx%d frame: dropped (later drops not logged)", w, h);
 }
 
-// One dav1d picture (8- or 10-bit 4:2:0) -> NV12 with 8-bit samples, and its RGBA; decoder thread
-static int make_picture(const Dav1dPicture *pic, Picture *p) {
+// The Video's deband planes for a w x h picture (convert thread). 0: no memory for them; the frame is then dropped
+// as for any allocation of a picture, and no planes are kept.
+static int planes_for(Video *v, int w, int h) {
+    size_t px = (size_t)w * h;
+    if (px <= v->plane_room) return 1;
+    free(v->y16), free(v->u16), free(v->v16);
+    v->y16 = malloc(px * 2), v->u16 = malloc(px / 2), v->v16 = malloc(px / 2);
+    v->plane_room = px;
+    if (v->y16 && v->u16 && v->v16) return 1;
+    free(v->y16), free(v->u16), free(v->v16);
+    v->y16 = v->u16 = v->v16 = NULL;
+    v->plane_room = 0;
+    return 0;
+}
+
+// One dav1d picture (8- or 10-bit 4:2:0) -> NV12 with 8-bit samples, and its RGBA; convert thread
+static int make_picture(Video *v, const Dav1dPicture *pic, Picture *p) {
     int w = pic->p.w, h = pic->p.h, hbd = pic->p.bpc > 8, sh = pic->p.bpc - 8;
     if (pic->p.layout != DAV1D_PIXEL_LAYOUT_I420) {
         static volatile int32_t logged;
@@ -346,11 +415,14 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
         // planes and writes the dithered NV12 rows. Reading the decoder's planes instead of an NV12 copy of them gives
         // the same samples, and nothing reads the frame while it is written, so each stripe finishes its rows alone:
         // one round of threads per frame instead of two, and no single-threaded copy before it.
-        uint16_t *Y16 = malloc((size_t)w * h * 2), *U16 = malloc((size_t)w * h / 2), *V16 = malloc((size_t)w * h / 2);
-        if (!Y16 || !U16 || !V16) rt_fatal("movie: out of memory for a %dx%d frame", w, h);
-        Stripe base = {2, 0, 0, w, h, o, Y16, U16, V16, NULL, pic->data[0], pic->data[1], pic->data[2], ys, cs};
+        if (!planes_for(v, w, h)) {
+            free(o);
+            movie_oom_log(w, h);
+            return 0;
+        }
+        Stripe base = {2, 0, 0, w, h, o, v->y16, v->u16, v->v16, NULL, pic->data[0], pic->data[1], pic->data[2],
+                       ys, cs};
         run_stripes(base);
-        free(Y16), free(U16), free(V16);
         *p = (Picture){o, NULL, w, h, pic->m.timestamp, 0};
         return 1;
     }
@@ -368,27 +440,26 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
         }
     }
     // debanded planes (NX2NAVI_MOVIE_DEBAND=0 keeps the decoded ones), then the overlay's RGBA or the dithered NV12
+    if (!deband_on && !rgba) {
+        *p = (Picture){o, NULL, w, h, pic->m.timestamp, 0};
+        return 1;
+    }
     {
-        uint16_t *Y16 = malloc((size_t)w * h * 2), *U16 = malloc((size_t)w * h / 2), *V16 = malloc((size_t)w * h / 2);
-        if (!Y16 || !U16 || !V16) {
-            free(Y16), free(U16), free(V16), free(o), free(rgba);
+        if (!planes_for(v, w, h)) {
+            free(o), free(rgba);
             movie_oom_log(w, h);
             return 0;
         }
+        uint16_t *Y16 = v->y16, *U16 = v->u16, *V16 = v->v16;
         Stripe base = {0, 0, 0, w, h, o, Y16, U16, V16, rgba};
         if (deband_on) {
             run_stripes(base);
-        } else if (!rgba) {
-            free(Y16), free(U16), free(V16);
-            *p = (Picture){o, rgba, w, h, pic->m.timestamp, 0};
-            return 1;
         } else {
             for (size_t i = 0; i < (size_t)w * h; i++) Y16[i] = (uint16_t)(o[i] * 16);
             for (size_t i = 0; i < (size_t)w * h / 4; i++) U16[i] = (uint16_t)(uv[2 * i] * 16), V16[i] = (uint16_t)(uv[2 * i + 1] * 16);
         }
         base.phase = 1;
         run_stripes(base);
-        free(Y16), free(U16), free(V16);
     }
     *p = (Picture){o, rgba, w, h, pic->m.timestamp, 0};
     return 1;
@@ -456,7 +527,7 @@ static void convert_thread(void *arg) {
         } else {
             uint64_t t0 = plat_now_ns();
             Picture p;
-            int ok = make_picture(&d.pic, &p);
+            int ok = make_picture(v, &d.pic, &p);
             t_make_ns += plat_now_ns() - t0;
             n_made++;
             dav1d_picture_unref(&d.pic);
@@ -551,6 +622,9 @@ static void stop_thread(Video *v) {
 
 static void finalize(Video *v) {
     stop_thread(v);
+    free(v->y16), free(v->u16), free(v->v16);   // the convert thread, their only user, has been joined
+    v->y16 = v->u16 = v->v16 = NULL;
+    v->plane_room = 0;
     plat_mutex_lock(&v->codec);
     if (v->dav1d) dav1d_close(&v->dav1d);
     plat_mutex_unlock(&v->codec);
@@ -566,9 +640,15 @@ static void ov_ctor(Cpu *c) { *(Video **)arg_p(c, 0) = NULL; }
 static void ov_dtor(Cpu *c) {
     Video **slot = arg_p(c, 0);
     if (!slot || !*slot) return;
-    finalize(*slot);
-    set_live(*slot, 0);
-    free(*slot);   // the bound events' kernel handles stay, as for any guest event never destroyed
+    Video *v = *slot;
+    finalize(v);
+    set_live(v, 0);
+    // The decoder and convert threads are joined, so nothing signals the events now: they are destroyed and leave the
+    // kernel's table of system events before their memory goes (kernel.c kern_unbind_system_event). Kept, each
+    // decoder left two dead entries and their kernel handles, and a long session filled the table.
+    if (v->in_bound) kern_unbind_system_event(c, (uint64_t)(uintptr_t)v->in_ev);
+    if (v->out_bound) kern_unbind_system_event(c, (uint64_t)(uintptr_t)v->out_ev);
+    free(v);
     *slot = NULL;
     gfx_movie_stop();
 }
@@ -588,7 +668,7 @@ static void ov_initialize(Cpu *c) {
     Video *v = *slot;
     finalize(v);
     set_live(v, 1);
-    v->clock_on = 0;
+    v->clock_on = v->rel_on = 0;
     Dav1dSettings s;
     dav1d_default_settings(&s);
     // Frame threading on (dav1d picks the delay): heavy stretches of the title movie took longer than a frame to
@@ -674,7 +754,7 @@ static void ov_flush(Cpu *c) {
     if (v) {
         plat_mutex_lock(&v->lock);
         v->generation++;   // the decoder and convert threads drop what they are making
-        v->clock_on = 0;   // a seek: the report's real-time reference starts again from the next picture
+        v->clock_on = v->rel_on = 0;   // a seek: the report's real-time reference starts again from the next picture
         clear_queues(v);
         clear_converts(v);
         plat_mutex_unlock(&v->lock);
@@ -708,6 +788,15 @@ static void ov_decode(Cpu *c) {
         if (skip_ns >= 0) rt_log("movie: movies end after %.1f s (NX2NAVI_MOVIE_SKIP)", skip_ns / 1e9);
     }
     plat_mutex_lock(&v->lock);
+    // Finalize on another thread may have closed the decoder since the test above. finalize takes v->lock after it
+    // clears v->dav1d, so read here under v->lock it is either still set (the sample is queued before finalize's
+    // clear_queues, which drops it, and ov_finalize or the destructor then clears live) or already NULL: no sample
+    // makes a finalized decoder live again, which would hold the movie frame rate cap (frame_rate.c movie_cap_hz).
+    if (!v->dav1d) {
+        plat_mutex_unlock(&v->lock);
+        ret_x(c, 0);
+        return;
+    }
     if (skip_ns >= 0 && v->eos_queued) {   // after the early end: what the demuxer still sends is dropped
         plat_mutex_unlock(&v->lock);
         ret_x(c, 0);
@@ -805,9 +894,10 @@ static void ov_acquire(Cpu *c) {
             rt_log("movie: pacing over 600 frames: acquire gap avg %.2f ms, max %.2f ms; %d pictures waiting; "
                    "per frame shown: decoder thread waiting for samples %.2f ms, send %.2f ms, get %.2f ms; convert thread "
                    "%.2f ms per picture (%llu pictures); "
-                   "picture %.0f ms behind real time since the first picture",
+                   "picture %.0f ms behind real time since the first picture; on screen %.0f ms behind, %+.0f ms since its start",
                    sum_gap / 600 / 1e6, max_gap / 1e6, v->qn, t_wait_ns / 600 / 1e6, t_send_ns / 600 / 1e6,
-                   t_get_ns / 600 / 1e6, n_made ? t_make_ns / n_made / 1e6 : 0.0, (unsigned long long)n_made, lag / 1e6);
+                   t_get_ns / 600 / 1e6, n_made ? t_make_ns / n_made / 1e6 : 0.0, (unsigned long long)n_made, lag / 1e6, v->rel_lag / 1e6,
+                   (v->rel_lag - v->rel_lag0) / 1e6);
             t_wait_ns = t_send_ns = t_get_ns = t_make_ns = n_made = 0;
             sum_gap = max_gap = 0;
         }
@@ -816,7 +906,12 @@ static void ov_acquire(Cpu *c) {
     update_events(v);
     plat_mutex_unlock(&v->lock);
     if (p.rgba) gfx_movie_frame_own(p.rgba, p.w, p.h), p.rgba = NULL;   // the overlay takes the buffer
-    if (p.eos) gfx_movie_stop(), set_live(v, 0);
+    if (p.eos) {   // how the movie kept time: the picture on screen against the clock, at its start and its end
+        if (v->rel_on)
+            rt_log("movie: end of stream after %llu pictures: on screen %.0f ms behind real time, %+.0f ms since its start",
+                   (unsigned long long)v->shown, v->rel_lag / 1e6, (v->rel_lag - v->rel_lag0) / 1e6);
+        gfx_movie_stop(), set_live(v, 0);
+    }
     picture_free(&p);
     *out = v->frame[f];
     ret_x(c, 0);
@@ -828,7 +923,15 @@ static void ov_release(Cpu *c) {
     if (v) {
         plat_mutex_lock(&v->lock);
         for (int i = 0; i < v->nframe; i++)
-            if (v->frame[i] == fr) v->busy[i] = 0;
+            if (v->frame[i] == fr) {
+                v->busy[i] = 0;
+                int64_t ts;
+                memcpy(&ts, (uint8_t *)(uintptr_t)fr + 0x78, 8);
+                if (v->clock_on && !((uint8_t *)(uintptr_t)fr)[0x88]) {
+                    v->rel_lag = (int64_t)(plat_now_ns() - v->shown0_ns) - (ts - v->ts0);
+                    if (!v->rel_on) v->rel_lag0 = v->rel_lag, v->rel_on = 1;
+                }
+            }
         update_events(v);
         plat_mutex_unlock(&v->lock);
     }
