@@ -131,8 +131,9 @@ def cmd_build(a):
     p = pj.Project(a.project)
     t0 = time.time()
     target = p.build()
-    print(f'mod: {target} ({time.time() - t0:.0f} s). Play with [language] lang = {pj.LANG_CODES.get(p.slot, p.slot)} '
-          f'in nx2navi.ini.')
+    langs = ', '.join(pj.LANG_CODES.get(lang, lang) for lang in [p.slot] + p.also)
+    print(f'mod: {target} ({time.time() - t0:.0f} s). It shows in these game languages (nx2navi.ini [language] '
+          f'lang): {langs}.')
 
 
 def cmd_selftest(a):

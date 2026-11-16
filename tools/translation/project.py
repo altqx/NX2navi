@@ -38,6 +38,10 @@ game = "{game}"
 # The game language whose text this translation replaces. Play with that language:
 # nx2navi.ini, [language] section: lang = {lang}
 slot = "{slot}"
+# Other game languages that get the same translation, message by message (same file and label), so the mod also
+# shows it when the game runs in one of them: e.g. ["USen", "EUen"] for both English versions. A message without a
+# translation stays in that language.
+also = []
 # Shown beside each message as a comment (another game language), or "" for none.
 reference = "{reference}"
 # The mod's folder under <game>/mods; build replaces it.
@@ -96,6 +100,7 @@ class Project:
         cfg = tomllib.loads(cfg_path.read_text(encoding='utf-8'))
         self.game = Game(cfg['game'])
         self.slot = cfg.get('slot', 'JPja')
+        self.also = [lang for lang in cfg.get('also', []) if lang != self.slot]
         self.reference = cfg.get('reference', '') or None
         self.mod = cfg.get('mod', 'Translation')
         self.language = cfg.get('language', 'th')
@@ -269,7 +274,7 @@ class Project:
         archive = self.game.read(archive_path)
         use_fuzzy = self.build_cfg.get('fuzzy', False)
         use_drafts = self.build_cfg.get('drafts', True)
-        chosen = {}
+        chosen = {}       # (file, label) -> translation
         for name, data in sarc.read(archive):
             path = self.po_path(name)
             if not path.exists():
@@ -283,22 +288,30 @@ class Project:
                         or e.msgstr == e.msgid):
                     continue
                 if f'{rel} [{e.ctx}]' not in bad:
-                    chosen[(name, i)] = e.msgstr
+                    chosen[(name, e.ctx)] = e.msgstr
         shape = bool(self.font_cfg) and self.build_cfg.get('shape', True)
         codes = fonts.cluster_codes(fonts.clusters_in(chosen.values())) if shape else {}
-        replaced = {}
-        for name, data in sarc.read(archive):
-            m = msbt.Msbt(data)
-            new = list(m.messages)
-            for i in range(len(new)):
-                if (name, i) in chosen:
-                    new[i] = msbt.from_markup(fonts.precompose(chosen[(name, i)], codes))
-            if new != m.messages:
-                replaced[name] = m.encode(new)
-        if replaced:
-            put(archive_path, self.game.store_like(archive_path, sarc.write(archive, replaced)))
-        log(f'  text: {len(chosen)} translated messages in {len(replaced)} files'
-            + (f'; {len(codes)} different Thai clusters drawn as one glyph each' if shape else ''))
+        encoded = {key: msbt.from_markup(fonts.precompose(text, codes)) for key, text in chosen.items()}
+        for lang in [self.slot] + self.also:
+            # another language's archive has the slot's files and labels; its messages are matched by label
+            path = archive_path if lang == self.slot else self.text_archive(lang)
+            data_all = archive if lang == self.slot else self.game.read(path)
+            replaced, count = {}, 0
+            for name, data in sarc.read(data_all):
+                m = msbt.Msbt(data)
+                new = list(m.messages)
+                for i in range(len(new)):
+                    text = encoded.get((name, m.label(i)))
+                    if text is not None:
+                        new[i] = text
+                        count += 1
+                if new != m.messages:
+                    replaced[name] = m.encode(new)
+            if replaced:
+                put(path, self.game.store_like(path, sarc.write(data_all, replaced)))
+            log(f'  text {lang}: {count} translated messages in {len(replaced)} files'
+                + (f'; {len(codes)} different Thai clusters drawn as one glyph each' if shape and lang == self.slot
+                   else ''))
 
         # fonts
         paths = fonts.scalable(self.game)

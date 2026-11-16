@@ -184,9 +184,9 @@ checkout). Private: this folder holds text and images taken from the game; never
    the game; the context of an entry is the message's label. The comment `ref:` shows the {reference} text of the
    same message. Names: `glossary.tsv` (fill its translation column first and keep names consistent).
 2. `tools/translate.py check --project .` lists errors (the build refuses them) and hints.
-3. `tools/translate.py build --project .` writes the mod into `<game>/mods/{mod}`. Start the game with the {slot}
-   language: in `nx2navi.ini`, section `[language]`, `lang = {lang}`. Untranslated messages stay in the source
-   language.
+3. `tools/translate.py build --project .` writes the mod into `<game>/mods/{mod}`. The game shows it in the {slot}
+   language (`nx2navi.ini`, section `[language]`, `lang = {lang}`) and in the languages `also` in project.toml
+   names. Untranslated messages stay in the language the game runs in.
 4. `tools/translate.py status --project .` shows the progress.
 
 After a game or tool update, `tools/translate.py extract --project .` brings the PO files up to date: translations
